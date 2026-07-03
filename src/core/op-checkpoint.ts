@@ -180,24 +180,25 @@ export async function recordCompleted(
   // extract-conversation-facts serialize a MUTABLE map through here and rely on
   // stale keys being REMOVED; an append would make them unremovable. The full
   // set lands in the parent `completed_keys` JSONB column via a single UPSERT.
-  //
-  // #2328: `JSON.stringify(sorted)` bound to a `$3::jsonb` PARAM is the
-  // double-encode trap (postgres.js stringifies the string again → a jsonb
-  // SCALAR), which the v119 `completed_keys` array CHECK rejects on every write
-  // ("violates op_checkpoints_completed_keys_array"). It silently slipped the
-  // `check-jsonb-pattern` guard because that only matches the `${...}::jsonb`
-  // TEMPLATE form, not a positional param. Fix: pass the JS array as a native
-  // `text[]` param (the same shape `appendCompleted` relies on) and lift it to a
-  // jsonb array with `to_jsonb`. No JSON.stringify, no double-encode.
+  // #2339: bind through `$3::text::jsonb`, NOT `$3::jsonb`. Under postgres.js
+  // `.unsafe(sql, params)` (executeRawDirect's path) a JS string bound to a
+  // `$N::jsonb` param double-encodes — the text→jsonb cast wraps the already-JSON
+  // string into a jsonb *string scalar*, which fails the v119
+  // `op_checkpoints_completed_keys_array CHECK (jsonb_typeof = 'array')` and aborts
+  // every sync on real Postgres (PGLite parses it silently, which hid the bug).
+  // Casting through `text` first binds it as a plain text param so the text→jsonb
+  // cast parses it into a genuine jsonb array. This is the positional-param form of
+  // the CLAUDE.md double-encode trap (the grep guard only caught the template form).
+  // Sync uses `appendCompleted` (below, `unnest($3::text[])`) instead, never this.
   const sorted = [...keys].sort();
   return durableWrite(engine, key, 'write', () =>
     engine.executeRawDirect(
       `INSERT INTO op_checkpoints (op, fingerprint, completed_keys, updated_at)
-       VALUES ($1, $2, to_jsonb($3::text[]), now())
+       VALUES ($1, $2, $3::text::jsonb, now())
        ON CONFLICT (op, fingerprint) DO UPDATE
          SET completed_keys = EXCLUDED.completed_keys,
              updated_at     = now()`,
-      [key.op, key.fingerprint, sorted],
+      [key.op, key.fingerprint, JSON.stringify(sorted)],
     ));
 }
 
