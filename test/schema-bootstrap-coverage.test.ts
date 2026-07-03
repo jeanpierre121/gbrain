@@ -168,6 +168,12 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // SCHEMA_SQL replay creates the index. Powers `gbrain extract --stale` + the
   // `links_extraction_lag` doctor check.
   { kind: 'column', table: 'pages', column: 'links_extracted_at' },
+  // v0.42.56.0 (v121) — forward-referenced by `CREATE INDEX
+  // idx_timeline_event_page ON timeline_entries(event_page_id) WHERE
+  // event_page_id IS NOT NULL` + the idx_timeline_event_dedup partial UNIQUE.
+  // Pre-v121 brains have timeline_entries without this column; bootstrap adds
+  // it before SCHEMA_SQL replay creates the indexes (Life Chronicle, #2390).
+  { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
