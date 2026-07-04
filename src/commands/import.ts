@@ -531,6 +531,19 @@ function gitListSyncableFiles(
   strategy: SyncStrategy,
   multimodalOn: boolean,
 ): string[] | null {
+  // When the TARGET dir is itself gitignored (a collector's `data/` tree, a
+  // scratch export dir), `ls-files --exclude-standard` enumerates zero files
+  // and the import silently no-ops. The user pointed `gbrain import` at that
+  // dir explicitly — .gitignore expresses "don't COMMIT this", not "don't
+  // IMPORT this" — so fall back to the FS walk for the whole subtree.
+  // check-ignore exits 0 (ignored) → FS walk; 1 (not ignored) / 128 (not a
+  // repo) both throw → proceed to ls-files, which handles the non-repo case.
+  try {
+    execFileSync('git', ['-C', dir, 'check-ignore', '-q', '.'], { stdio: 'ignore' });
+    return null;
+  } catch {
+    /* dir not ignored (or not a repo) → continue to the ls-files fast path */
+  }
   let stdout: string;
   try {
     stdout = execFileSync(
