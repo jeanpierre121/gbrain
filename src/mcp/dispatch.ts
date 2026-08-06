@@ -77,6 +77,12 @@ export interface DispatchOpts {
    * was replaced by dispatchToolCall.
    */
   auth?: AuthInfo;
+  /**
+   * Transport label for known-but-unauthenticated call sites (currently only
+   * the stdio MCP server). Threaded onto OperationContext.transport so whoami
+   * can answer without auth; see the field doc in operations.ts.
+   */
+  transport?: 'stdio';
 }
 
 /**
@@ -218,6 +224,7 @@ export function buildOperationContext(
     // this fallback covers code paths that historically passed undefined.
     sourceId: opts.sourceId ?? 'default',
     auth: opts.auth,
+    transport: opts.transport,
   };
 }
 

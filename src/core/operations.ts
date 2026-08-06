@@ -287,6 +287,17 @@ export interface OperationContext {
    */
   auth?: AuthInfo;
   /**
+   * Transport label for call sites that are remote-posture (`remote: true`)
+   * and carry no per-token auth, yet are a KNOWN transport rather than an
+   * ambiguous one. Currently only the stdio MCP server declares itself
+   * (`'stdio'`: local unauthenticated pipe on a single-owner machine).
+   * `whoami` uses this to answer without `ctx.auth`; callers with neither
+   * auth nor a transport label still throw `unknown_transport` (fail-closed,
+   * v0.26.9 posture). NOT a trust signal — trust decisions key on
+   * `ctx.remote === false` and `ctx.auth` scopes only.
+   */
+  transport?: 'stdio';
+  /**
    * True when the caller is remote/untrusted (MCP over stdio/HTTP, or any agent-facing entry point).
    * False for local CLI invocations by the owner of the machine.
    *
@@ -3675,12 +3686,13 @@ const get_recent_transcripts: Operation = {
 const whoami: Operation = {
   name: 'whoami',
   description:
-    'Introspect the calling identity. Returns one of three transport shapes: ' +
+    'Introspect the calling identity. Returns one of four transport shapes: ' +
     '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
+    '{transport: "legacy", token_name, scopes, expires_at: null}, ' +
+    '{transport: "stdio", scopes: []} (local unauthenticated MCP pipe), or ' +
     '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
-    'context is ambiguous (remote=true without auth) — fail-closed posture ' +
-    'mirroring the v0.26.9 trust-boundary contract.',
+    'context is ambiguous (remote=true without auth or a declared transport) ' +
+    '— fail-closed posture mirroring the v0.26.9 trust-boundary contract.',
   params: {},
   scope: 'read',
   handler: async (ctx) => {
@@ -3693,11 +3705,18 @@ const whoami: Operation = {
       return { transport: 'local', scopes: [] };
     }
     if (!ctx.auth) {
+      // The stdio MCP pipe is unauthenticated by design (single-owner local
+      // machine) but declares itself via ctx.transport, so it is NOT the
+      // ambiguous case. Same anti-footgun as 'local': empty scopes force
+      // clients to branch on `transport`, never on scope contents.
+      if (ctx.transport === 'stdio') {
+        return { transport: 'stdio', scopes: [] };
+      }
       throw new OperationError(
         'unknown_transport',
         'whoami called over a remote transport that did not thread ctx.auth. ' +
-          'This is a transport bug — every remote call site must populate ctx.auth ' +
-          'or set ctx.remote === false.',
+          'This is a transport bug — every remote call site must populate ctx.auth, ' +
+          'declare ctx.transport, or set ctx.remote === false.',
       );
     }
     // OAuth tokens have client_id starting with 'gbrain_cl_'; legacy

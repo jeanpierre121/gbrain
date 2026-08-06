@@ -52,6 +52,10 @@ export async function startMcpServer(engine: BrainEngine) {
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
     return dispatchToolCall(engine, name, params, {
       remote: true,
+      // Declared transport: the stdio pipe has no per-token auth but is a
+      // known local transport — lets whoami answer instead of throwing
+      // unknown_transport (which is reserved for genuinely ambiguous sites).
+      transport: 'stdio',
       trustedFactReads,
       takesHoldersAllowList: ['world'],
       // v0.31: source defaults to 'default' for stdio (no per-token scope).

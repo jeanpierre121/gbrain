@@ -94,10 +94,39 @@ describe('whoami op contract', () => {
     expect(result.expires_at).toBeNull();
   });
 
+  test('stdio transport (declared, no auth) returns empty scopes', async () => {
+    // The stdio MCP pipe is unauthenticated but declares itself via
+    // ctx.transport — whoami must answer, not throw unknown_transport.
+    const result = (await whoami.handler(
+      ctxWith({ remote: true, auth: undefined, transport: 'stdio' }),
+      {},
+    )) as any;
+    expect(result.transport).toBe('stdio');
+    expect(result.scopes).toEqual([]);
+  });
+
+  test('stdio label does not override real auth (oauth still wins)', async () => {
+    // If a future transport sets both, auth identifies the caller more
+    // precisely than the label — the label only covers the auth-less case.
+    const auth: AuthInfo = {
+      token: 'gbrain_at_xxx',
+      clientId: 'gbrain_cl_abc',
+      clientName: 'gstack-test',
+      scopes: ['read'],
+      expiresAt: 1234567890,
+    };
+    const result = (await whoami.handler(
+      ctxWith({ remote: true, auth, transport: 'stdio' }),
+      {},
+    )) as any;
+    expect(result.transport).toBe('oauth');
+  });
+
   // Q3: ambiguous transport — fail-closed. The footgun this guards against
-  // is a future transport that lands without threading auth, where a buggy
-  // caller might trust whoami's output to gate sensitive ops.
-  test('unknown_transport throws when remote=true AND auth is missing', async () => {
+  // is a future transport that lands without threading auth OR declaring
+  // ctx.transport, where a buggy caller might trust whoami's output to gate
+  // sensitive ops.
+  test('unknown_transport throws when remote=true with no auth and no declared transport', async () => {
     try {
       await whoami.handler(ctxWith({ remote: true, auth: undefined }), {});
       throw new Error('expected throw');
@@ -117,6 +146,31 @@ describe('whoami op contract', () => {
     } catch (e) {
       expect(e).toBeInstanceOf(OperationError);
     }
+  });
+});
+
+describe('stdio transport wiring', () => {
+  // The contract tests above use a hand-built context, so on their own they
+  // can't catch a regression that drops the label at either wiring site.
+  // These two pins close that gap: the dispatcher must thread opts.transport
+  // onto the context, and the stdio server must actually declare it.
+  test('buildOperationContext threads opts.transport onto the context', async () => {
+    const { buildOperationContext } = await import('../src/mcp/dispatch.ts');
+    const ctx = buildOperationContext({} as any, {}, { remote: true, transport: 'stdio' });
+    expect(ctx.transport).toBe('stdio');
+    const bare = buildOperationContext({} as any, {}, { remote: true });
+    expect(bare.transport).toBeUndefined();
+  });
+
+  test('stdio server declares transport: stdio in its dispatch opts (static pin)', () => {
+    const src = require('node:fs').readFileSync(
+      require('node:path').join(import.meta.dir, '../src/mcp/server.ts'),
+      'utf8',
+    );
+    // The label must live inside the dispatchToolCall opts of the tool-call
+    // handler. A plain source pin (repo wiring-test precedent) is enough:
+    // deleting the declaration reverts stdio whoami to unknown_transport.
+    expect(src).toMatch(/dispatchToolCall\(engine, name, params, \{[\s\S]{0,400}transport: 'stdio'/);
   });
 });
 
