@@ -2,18 +2,19 @@
 
 ## whoami stdio-fix follow-ups (filed on fork run/full-facts, 2026-08-06)
 
-- [ ] **P2 — `FactReaderTrust` trust polarity contradicts the repo-wide fail-closed
-  invariant.** `factsWorldOnly()` (`src/core/facts/reader-trust.ts:28`) returns
-  trusted for a MISSING `remote` (`t.remote === true && ...`), and its interface
-  doc says "anything not strictly `true` is local/trusted" — the exact opposite
-  of CLAUDE.md's "anything not strictly `false` is remote/untrusted" invariant.
-  Deliberate at the time (engine-level callers in
-  `postgres-engine.ts:4262` / `pglite-engine.ts:4147` pass opts objects that may
-  omit `remote` on local paths), but it's the same cast-bypass class the whoami
-  F7b guard closed. Decide: either flip the helper to `t.remote !== false` after
-  auditing every engine caller threads an explicit `remote`, or document the
-  polarity exception in CLAUDE.md's invariants list. Surfaced by the 2026-08-06
-  codex doc review; found, not fixed, in a docs-only pass.
+- [x] **P2 — `FactReaderTrust` trust polarity contradicts the repo-wide fail-closed
+  invariant.** RESOLVED 2026-08-06 (flip, not documentation): `factsWorldOnly()`
+  is now `t.remote !== false` — an omitted `remote` (cast-bypassed context,
+  forgotten threading) reads world-only instead of leaking private facts. Full
+  engine-caller audit ran first; every trusted local caller now passes
+  `remote: false` explicitly (CLI think, auto-think dream cycle,
+  founder-scorecard, eval-trajectory) and the two fail-open ops-layer coercions
+  (`ctx.remote === true` in the think + find_trajectory handlers) flipped to
+  `ctx.remote !== false`. New pins in `test/facts-reader-trust.test.ts` +
+  `test/engine-find-trajectory.test.ts` assert the fail-closed default.
+  Owner-visible behavior unchanged (stdio trustedFactReads and explicit-false
+  paths land exactly where they did). Surfaced by the 2026-08-06 codex doc
+  review.
 
 ## Life Chronicle follow-ups (filed v0.42.56.0, #2390)
 

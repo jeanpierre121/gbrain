@@ -127,8 +127,8 @@ export async function runEvalTrajectory(engine: BrainEngine, args: string[]): Pr
     result = unpackToolResult<WireTrajectoryResult>(raw);
   } else {
     // Local: call engine.findTrajectory directly, then compute derived
-    // metrics via trajectory.ts. ctx.remote is implicitly false here so
-    // visibility filtering is OFF — trusted local caller sees all facts.
+    // metrics via trajectory.ts. remote:false below keeps visibility
+    // filtering OFF — trusted local caller sees all facts.
     // v0.40.2.0: kind:'metric' is explicit clarity (downstream
     // computeTrajectoryStats already filters NULL-metric rows; the filter
     // surfaces intent at the call site).
@@ -139,6 +139,8 @@ export async function runEvalTrajectory(engine: BrainEngine, args: string[]): Pr
       since: parsed.since,
       until: parsed.until,
       limit: parsed.limit,
+      // Fail-closed trust: local CLI must say so explicitly (reader-trust.ts).
+      remote: false,
     });
     const { regressions, drift_score } = computeTrajectoryStats(points);
     result = {
