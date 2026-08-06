@@ -129,6 +129,21 @@ echo hi
     expect(langs.has('bash')).toBe(true);
   });
 
+  // marked >= 18.0.9 regression pin: marked 18.0.0's lexer infinite-loops on
+  // tab-indented lines containing a non-breaking space (U+00A0) — the shape
+  // HTML emails produce via &nbsp; in table layouts. extractFencedChunks runs
+  // marked.lexer on every page body, so a re-regression hangs EVERY import of
+  // such content at 100% CPU (SIGTERM-immune; only kill -9 worked). The
+  // timeout turns that hang into a loud test failure.
+  test('tab+NBSP content imports without hanging the lexer (marked ReDoS pin)', async () => {
+    // \u00A0 spelled as an escape on purpose: a literal NBSP is visually
+    // identical to a space, which is exactly how the trigger hid in the wild.
+    const md = 'Email thread body.\n\n\t\t\t\t\t\t\u00A0\n\t\t\t\t\t\n\t\t\t\t\t\u00A0\n\nMore prose.';
+    await importFromContent(engine, 'guides/fence-nbsp-tabs', md, { noEmbed: true });
+    const chunks = await engine.getChunks('guides/fence-nbsp-tabs');
+    expect(chunks.length).toBeGreaterThan(0);
+  }, 15_000);
+
   test('empty fence body is skipped (no chunks)', async () => {
     const md = "Intro.\n\n```ts\n```\n";
     await importFromContent(engine, 'guides/fence-empty', md, { noEmbed: true });
