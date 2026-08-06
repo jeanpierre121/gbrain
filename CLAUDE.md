@@ -58,7 +58,7 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
   sites; `ctx.remote !== false` for untrust-unless-explicit-false). Don't default it falsy.
   `ctx.transport` is a transport-identity label only (stdio declares it so `whoami` can answer
   on the unauthenticated local pipe). It is never a trust gate: trust decisions key on
-  `ctx.remote` and `ctx.auth` scopes.
+  `ctx.remote`, `ctx.auth` scopes, and explicit owner opt-ins (`trustedFactReads`).
 - **Source isolation.** Every read-side op routes through `sourceScopeOpts(ctx)`; precedence
   is federated array (`ctx.auth.allowedSources`) > scalar (`ctx.sourceId`) > nothing. Don't
   hand-roll source filtering — a missed thread is a cross-source data leak.

@@ -1,5 +1,20 @@
 # TODOS
 
+## whoami stdio-fix follow-ups (filed on fork run/full-facts, 2026-08-06)
+
+- [ ] **P2 — `FactReaderTrust` trust polarity contradicts the repo-wide fail-closed
+  invariant.** `factsWorldOnly()` (`src/core/facts/reader-trust.ts:28`) returns
+  trusted for a MISSING `remote` (`t.remote === true && ...`), and its interface
+  doc says "anything not strictly `true` is local/trusted" — the exact opposite
+  of CLAUDE.md's "anything not strictly `false` is remote/untrusted" invariant.
+  Deliberate at the time (engine-level callers in
+  `postgres-engine.ts:4262` / `pglite-engine.ts:4147` pass opts objects that may
+  omit `remote` on local paths), but it's the same cast-bypass class the whoami
+  F7b guard closed. Decide: either flip the helper to `t.remote !== false` after
+  auditing every engine caller threads an explicit `remote`, or document the
+  polarity exception in CLAUDE.md's invariants list. Surfaced by the 2026-08-06
+  codex doc review; found, not fixed, in a docs-only pass.
+
 ## Life Chronicle follow-ups (filed v0.42.56.0, #2390)
 
 Deferred from the Life Chronicle wave (CEO Scope-Expansion + eng review CLEARED,
