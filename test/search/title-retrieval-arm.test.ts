@@ -228,6 +228,81 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
     const hits = await engine.searchKeyword('zzznothinghere', { limit: 10, orFallback: true });
     expect(hits.length).toBe(0);
   });
+
+  test('the OR retry is BOUNDED and BEST-EFFORT: a cancelled retry degrades to the strict-AND rows', async () => {
+    await seedQuantumPage();
+
+    // The retry runs under its own tight statement_timeout because
+    // OR-of-all-terms can match a large fraction of the corpus and ts_rank
+    // detoasts every matched tsvector before sorting (measured on a ~170k-chunk
+    // Postgres brain: 96ms strict-AND vs 10.3s OR, same query). It only fires
+    // when strict AND already returned zero rows, so a cancelled retry costs
+    // recall on one arm of a hybrid search — never correctness.
+    //
+    // Simulate the cancel at the driver seam: the FIRST query (strict AND) runs
+    // for real and returns zero rows; the retry raises SQLSTATE 57014, exactly
+    // as a statement_timeout would.
+    const realQuery = engine.db.query.bind(engine.db);
+    const realTransaction = engine.db.transaction.bind(engine.db);
+    let retryAttempts = 0;
+    const cancel = (): never => {
+      retryAttempts++;
+      const err = new Error('canceling statement due to statement timeout') as Error & { code: string };
+      err.code = '57014';
+      throw err;
+    };
+    // Both engines route the retry differently (PGLite wraps it in a
+    // transaction to scope SET LOCAL); stub both seams so the test pins
+    // BEHAVIOR, not the plumbing.
+    engine.db.transaction = cancel as unknown as typeof engine.db.transaction;
+    let seenQueries = 0;
+    engine.db.query = ((sql: string, params?: unknown[]) => {
+      // Only the keyword statement participates; schema/reset chatter passes through.
+      if (typeof sql === 'string' && sql.includes('ranked') && ++seenQueries > 1) return cancel();
+      return realQuery(sql, params as never);
+    }) as unknown as typeof engine.db.query;
+
+    try {
+      const hits = await engine.searchKeyword('quantum lattice harmonics zzzmissingtoken', {
+        limit: 10,
+        orFallback: true,
+      });
+      // Degraded, NOT thrown: the caller gets the empty strict-AND result.
+      expect(hits).toEqual([]);
+      expect(retryAttempts).toBeGreaterThan(0);
+    } finally {
+      engine.db.query = realQuery as unknown as typeof engine.db.query;
+      engine.db.transaction = realTransaction as unknown as typeof engine.db.transaction;
+    }
+  });
+
+  test('a NON-timeout error from the OR retry still propagates (a broken arm must not ship dark)', async () => {
+    await seedQuantumPage();
+
+    const realQuery = engine.db.query.bind(engine.db);
+    const realTransaction = engine.db.transaction.bind(engine.db);
+    const boom = (): never => {
+      throw new Error('relation "content_chunks" does not exist');
+    };
+    engine.db.transaction = boom as unknown as typeof engine.db.transaction;
+    let seenQueries = 0;
+    engine.db.query = ((sql: string, params?: unknown[]) => {
+      if (typeof sql === 'string' && sql.includes('ranked') && ++seenQueries > 1) return boom();
+      return realQuery(sql, params as never);
+    }) as unknown as typeof engine.db.query;
+
+    try {
+      await expect(
+        engine.searchKeyword('quantum lattice harmonics zzzmissingtoken', {
+          limit: 10,
+          orFallback: true,
+        }),
+      ).rejects.toThrow(/does not exist/);
+    } finally {
+      engine.db.query = realQuery as unknown as typeof engine.db.query;
+      engine.db.transaction = realTransaction as unknown as typeof engine.db.transaction;
+    }
+  });
 });
 
 describe('buildOrFallbackWebsearchQuery — pure', () => {

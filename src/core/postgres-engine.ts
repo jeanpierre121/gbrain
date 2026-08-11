@@ -24,7 +24,7 @@ import {
   isRetryableConnError,
   type BatchAuditSite,
 } from './retry.ts';
-import { isConnectionEndedError } from './retry-matcher.ts';
+import { isConnectionEndedError, isStatementTimeoutError } from './retry-matcher.ts';
 import {
   valueHash,
   normalizeDimension,
@@ -98,6 +98,20 @@ import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
+
+/**
+ * Budget for searchKeyword's AND→OR recall retry (D2 fallback), deliberately
+ * far tighter than the 8s search budget the strict-AND pass gets.
+ *
+ * The retry only ever runs when strict AND already returned zero rows, so its
+ * result is a bonus: timing it out costs recall on one arm of a hybrid search,
+ * never correctness. Meanwhile its worst case is brutal — OR-of-all-terms on a
+ * conceptual query matches tens of thousands of chunks and ts_rank must detoast
+ * every tsvector before sorting.
+ *
+ * Keep in lockstep with the twin in `pglite-engine.ts` (engine parity).
+ */
+const OR_FALLBACK_STATEMENT_TIMEOUT = '2s';
 
 export function getPostgresSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
@@ -1830,9 +1844,18 @@ export class PostgresEngine implements BrainEngine {
     // the GUC can never leak onto a pooled connection). Flag off → the
     // wrap is identical to master's; flag on → set_config('app.scopes')
     // shares the same transaction as the timeout.
-    const runKeyword = (queryText: string) =>
+    const runKeyword = (queryText: string, timeoutOverride?: string) =>
       this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
-        await tx`SET LOCAL statement_timeout = '8s'`;
+        if (timeoutOverride) {
+          // set_config(..., is_local => true) IS `SET LOCAL`, but it takes a
+          // bind parameter (plain SET LOCAL does not). Same pattern this file
+          // already uses for hnsw.ef_search in searchVector. The strict-AND
+          // path below keeps its literal spelling so its statement text — and
+          // therefore its pg_stat_statements queryid — is unchanged.
+          await tx`SELECT set_config('statement_timeout', ${timeoutOverride}, true)`;
+        } else {
+          await tx`SET LOCAL statement_timeout = '8s'`;
+        }
         const boundParams = [...params];
         boundParams[0] = queryText;
         return await tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
@@ -1849,7 +1872,31 @@ export class PostgresEngine implements BrainEngine {
     // link-extraction, eval) keep the strict-AND contract.
     if (rows.length === 0 && opts?.orFallback) {
       const orQuery = buildOrFallbackWebsearchQuery(query);
-      if (orQuery) rows = await runKeyword(orQuery);
+      if (orQuery) {
+        // The OR retry is a RECALL BONUS, not a correctness requirement — the
+        // strict-AND contract is already satisfied by the empty `rows` above.
+        // So it gets its own, much tighter budget and is best-effort.
+        //
+        // Why it needs one: OR-of-all-terms on a conceptual query matches tens
+        // of thousands of chunks, and ts_rank has to detoast every tsvector
+        // before the sort. Measured on the host brain (~170k text chunks): the
+        // AND path is ~96ms / 1.3k buffers, the OR path 10.3s / 175k buffers
+        // (~1.4GB) for the SAME query. Under the 8s budget that reliably burned
+        // the whole budget and then produced nothing anyway.
+        //
+        // 2s is chosen against the AND path's ~96ms: it is ~20x headroom, so a
+        // genuinely cheap OR retry (few matching chunks) still lands, while the
+        // pathological wide-match case is cut off early instead of blocking the
+        // caller for 8s. On timeout we keep the strict-AND rows.
+        try {
+          rows = await runKeyword(orQuery, OR_FALLBACK_STATEMENT_TIMEOUT);
+        } catch (err) {
+          // Swallow ONLY the retry's own cancellation. Any other error (and any
+          // timeout from the strict-AND path above, which is outside this try)
+          // still propagates — a broken keyword arm must not ship dark.
+          if (!isStatementTimeoutError(err)) throw err;
+        }
+      }
     }
     return rows.map(rowToSearchResult);
   }

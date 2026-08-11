@@ -1112,7 +1112,25 @@ export async function hybridSearch(
     earlyModality === 'image'
       ? [[], []]
       : await Promise.all([
-          engine.searchKeyword(query, searchOpts),
+          // Fail-open WITH SIGNAL, same contract as the title arm below. The
+          // keyword arm is ONE recall arm among several (vector, title,
+          // relational); a SQL error or a statement_timeout in it must degrade
+          // recall, never fail the whole search. Pre-fix it had no .catch, so a
+          // single 57014 on the keyword arm rejected the Promise.all and threw
+          // away an already-completed vector arm — the user got a hard error
+          // instead of the vector-plus-title result set that was sitting right
+          // there. The engine-side AND→OR fallback (searchKeyword, opted into by
+          // `orFallback` above) is the realistic timeout source: a conceptual
+          // query with no lexical anchor matches zero chunks on strict AND, and
+          // the OR-of-all-terms retry can touch tens of thousands of chunks.
+          engine.searchKeyword(query, searchOpts).catch((err: unknown) => {
+            warnOncePerProcess(
+              'search-keyword-arm-failed',
+              `[gbrain] searchKeyword arm failed (fail-open, keyword candidates skipped): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+            return [] as SearchResult[];
+          }),
           engine.searchTitles(query, searchOpts).catch((err: unknown) => {
             warnOncePerProcess(
               'search-titles-arm-failed',

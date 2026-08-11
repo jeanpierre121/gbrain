@@ -90,8 +90,22 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { hasCJK, escapeLikePattern } from './cjk.ts';
+import { isStatementTimeoutError } from './retry-matcher.ts';
 
 type PGLiteDB = PGlite;
+
+/**
+ * Budget for searchKeyword's AND→OR recall retry (D2 fallback), deliberately
+ * far tighter than the strict-AND pass. The retry only runs when strict AND
+ * already returned zero rows, so timing it out costs recall on one arm of a
+ * hybrid search, never correctness — while its worst case (OR-of-all-terms over
+ * a large corpus, ts_rank detoasting every matched tsvector) is unbounded.
+ *
+ * Keep in lockstep with the twin in `postgres-engine.ts` (engine parity).
+ * Module-level literal, never caller input — it is interpolated into SET LOCAL,
+ * which takes no bind parameter.
+ */
+const OR_FALLBACK_STATEMENT_TIMEOUT = '2s';
 
 // Tier 3 snapshot fast-restore. Reads a tar dump produced by
 // `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
@@ -1718,9 +1732,34 @@ export class PGLiteEngine implements BrainEngine {
     if (rows.length === 0 && opts?.orFallback) {
       const orQuery = buildOrFallbackWebsearchQuery(query);
       if (orQuery) {
+        // Parity twin of postgres-engine.ts: the OR retry is a RECALL BONUS,
+        // not a correctness requirement (the strict-AND contract is already
+        // satisfied by the empty `rows` above), so it runs on its own tight
+        // budget and is best-effort. OR-of-all-terms can match a large fraction
+        // of the corpus, and ts_rank detoasts every matched tsvector before
+        // sorting; on the Postgres engine that measured 10.3s vs 96ms for the
+        // strict-AND pass on the same query.
+        //
+        // The GUC is scoped with SET LOCAL inside an explicit transaction so it
+        // cannot leak. NOTE: PGLite accepts and reports statement_timeout but
+        // does NOT enforce it — the WASM build has no interrupt to fire the
+        // cancel (verified 2026-08-11). So on this engine the bound is
+        // declarative today and the load-bearing half is the catch below, which
+        // keeps behavior identical to the Postgres engine if a cancel ever does
+        // arrive. PGLite brains are also orders of magnitude smaller, which is
+        // why the pathological plan does not bite here in the first place.
         const fallbackParams = [...params];
         fallbackParams[0] = orQuery;
-        ({ rows } = await this.db.query(keywordSql, fallbackParams));
+        try {
+          ({ rows } = await this.db.transaction(async (tx) => {
+            await tx.query(`SET LOCAL statement_timeout = '${OR_FALLBACK_STATEMENT_TIMEOUT}'`);
+            return await tx.query(keywordSql, fallbackParams);
+          }) as { rows: unknown[] });
+        } catch (err) {
+          // Swallow ONLY the retry's own cancellation; everything else still
+          // propagates so a broken keyword arm cannot ship dark.
+          if (!isStatementTimeoutError(err)) throw err;
+        }
       }
     }
 
