@@ -96,6 +96,32 @@ beforeAll(() => {
   delete runEnv.ANTHROPIC_API_KEY;
   delete runEnv.GOOGLE_API_KEY;
 
+  // Strip the DB URLs too — GBRAIN_HOME and `--pglite` do NOT win against
+  // them. `loadConfig()` calls `effectiveEnvDatabaseUrl()` FIRST
+  // (src/core/config.ts): a non-empty GBRAIN_DATABASE_URL (or, failing that,
+  // DATABASE_URL) forces `engine: 'postgres'` and clears `database_path`,
+  // overriding the PGLite config that `gbrain init --pglite` writes into
+  // tmpHome one line below. Only `init` itself honours `--pglite`; every verb
+  // after it re-reads config and gets repointed.
+  //
+  // This is not hypothetical. On 2026-08-06 this file ran with the operator's
+  // production GBRAIN_DATABASE_URL exported (it lives in ~/.zshrc) and the
+  // `gbrain sync` below imported alpha.md/beta.md into the PRODUCTION brain,
+  // then overwrote the `default` row in `sources` — repointing its
+  // `local_path` at repoSourceDir (a $TMPDIR path that vanished on reap) and
+  // its `last_commit` at the seed commit made just above. The dangling
+  // local_path silently disabled put_page write-through and broke bare
+  // `gbrain sync` until it was found four days later.
+  //
+  // `scripts/run-e2e.sh` scrubs GBRAIN_* and would have caught it; running
+  // this one file directly (`bun test test/e2e/pglite-cli-exit.serial.test.ts`)
+  // bypasses that wrapper. test/helpers/db-url-preload.ts now clears
+  // GBRAIN_DATABASE_URL for every `bun test` process; these deletes are the
+  // local belt-and-braces, and they also cover DATABASE_URL, which the
+  // preload deliberately leaves alone because the Postgres e2e files need it.
+  delete runEnv.GBRAIN_DATABASE_URL;
+  delete runEnv.DATABASE_URL;
+
   const initResult = spawnSync(
     SHIM_PATH,
     ['init', '--pglite', '--repo', repoSourceDir, '--no-embedding', '--yes'],
