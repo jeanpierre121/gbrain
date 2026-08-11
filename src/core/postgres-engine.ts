@@ -1881,13 +1881,30 @@ export class PostgresEngine implements BrainEngine {
         // of thousands of chunks, and ts_rank has to detoast every tsvector
         // before the sort. Measured on the host brain (~170k text chunks): the
         // AND path is ~96ms / 1.3k buffers, the OR path 10.3s / 175k buffers
-        // (~1.4GB) for the SAME query. Under the 8s budget that reliably burned
-        // the whole budget and then produced nothing anyway.
+        // (~1.4GB) for the SAME query.
         //
-        // 2s is chosen against the AND path's ~96ms: it is ~20x headroom, so a
-        // genuinely cheap OR retry (few matching chunks) still lands, while the
-        // pathological wide-match case is cut off early instead of blocking the
-        // caller for 8s. On timeout we keep the strict-AND rows.
+        // The budget is chosen against the OR retry's OWN cost curve, not
+        // against the AND path. The AND time carries no information about it:
+        // a control query's AND is fast and its OR is ~300ms, while an
+        // and_miss query's AND is also fast and its OR needs 25s. What the
+        // cost tracks is the tsvectors ts_rank must detoast. Measured cold on
+        // 2026-08-11: OR expansions matching up to ~10k chunks return in
+        // 200-900ms, ~12k-17k lands at 1.1-2.0s, and the 30k-100k expansions
+        // typical of long conceptual questions need 3-25s. Re-executed warm
+        // the same statements return in ~120ms, so the cost only bites the
+        // first execution of a given term set, which is exactly the novel
+        // query the cache cannot help.
+        //
+        // 2s therefore admits every narrow and moderate retry, including the
+        // 1.0-2.0s band that supplies a third to a half of the final ranked
+        // answer on those queries, and cuts only the wide-match case that was
+        // never going to return inside any sane budget. Dropping to 1s was
+        // measured and rejected on 2026-08-11: it buys ~1.2s of p95 on an
+        // already non-fatal path and costs the entire keyword arm on that
+        // band. Any lower cutoff strictly enlarges the set of dropped arms.
+        // If this is revisited, the better lever is the OR match count, which
+        // a plain count(*) on the same predicate gets cheaply because it does
+        // not detoast. On timeout we keep the strict-AND rows.
         try {
           rows = await runKeyword(orQuery, OR_FALLBACK_STATEMENT_TIMEOUT);
         } catch (err) {
