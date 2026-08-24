@@ -6,6 +6,11 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import matter from 'gray-matter';
+import {
+  compileExcludePatterns,
+  DEFAULT_EXCLUDE_PATTERNS,
+} from '../src/core/cycle/transcript-discovery.ts';
 import {
   inferFrontmatter,
   extractDateFromFilename,
@@ -259,6 +264,36 @@ describe('serializeFrontmatter', () => {
     expect(fm).toContain('title: "What\'s the deal: a \\"primer\\""');
   });
 
+  // Regression: the title quoting rule was a denylist of "special" chars and
+  // every gap corrupted a page at import. A round trip through gray-matter is
+  // the assertion that matters — `toContain` on the emitted string cannot tell
+  // a throw from a silent coercion.
+  describe('title quoting round-trips through the YAML parser', () => {
+    const cases: Array<[string, string]> = [
+      ['leading backtick (blocked docs/guides/skillopt.md)', '`gbrain skillopt` — Self-evolving skills'],
+      ['leading @ (YAML c-reserved)', '@mentions and you'],
+      ['leading % (directive indicator)', '% completion tracking'],
+      ['leading dash (parsed as a sequence — title went undefined)', '- dash leading title'],
+      ['bare true (coerced to boolean)', 'true'],
+      ['bare year (coerced to number)', '2026'],
+      ['plain safe title', 'Search Modes'],
+      ['colon and quotes', 'What\'s the deal: a "primer"'],
+    ];
+    for (const [label, title] of cases) {
+      test(label, () => {
+        const parsed = matter(serializeFrontmatter({ title, type: 'guide' }));
+        expect(parsed.data.title).toBe(title);
+        expect(typeof parsed.data.title).toBe('string');
+      });
+    }
+  });
+
+  test('leaves a provably-safe title unquoted', () => {
+    expect(serializeFrontmatter({ title: 'Alice Smith', type: 'note' })).toContain(
+      'title: Alice Smith',
+    );
+  });
+
   test('returns empty string for skipped files', () => {
     expect(serializeFrontmatter({ title: '', type: '', skipped: true })).toBe('');
   });
@@ -335,6 +370,28 @@ describe('DIRECTORY_RULES', () => {
       ts(r.titleStrategy) === ts(generic.titleStrategy);
     return sameFields && [...(r.tags ?? [])].sort().join(',') === derived;
   };
+
+  // Transcripts matching gbrain's sensitivity vocabulary are dropped before any
+  // LLM call. A shipped DIRECTORY_RULE that maps a specific person's folder
+  // onto one of those categories encodes a private fact about a real individual
+  // into every install, which the Privacy rule in CLAUDE.md forbids for
+  // checked-in code. Personal mappings belong in the operator's own notes.
+  //
+  // Matched with the production compiler, not a local `includes`: bare words
+  // compile to \b<word>\b, so `therapy-notes` and `medical records` are caught
+  // the same way discoverTranscripts catches them. An exact-equality check
+  // would let those spellings recreate the association with CI green.
+  test('no shipped rule binds a path to a sensitive category', () => {
+    const res = compileExcludePatterns([...DEFAULT_EXCLUDE_PATTERNS]);
+    expect(res.length).toBe(DEFAULT_EXCLUDE_PATTERNS.length); // no silent drop
+    const offenders = DIRECTORY_RULES.filter(r =>
+      (r.tags ?? []).some(t => res.some(re => re.test(t))),
+    );
+    // Report indices, not prefixes: an offending prefix is by definition the
+    // kind of string this test exists to keep out of public artifacts, and a
+    // failing assertion is printed into CI logs.
+    expect(offenders.map(r => DIRECTORY_RULES.indexOf(r))).toEqual([]);
+  });
 
   test('Apple Notes rules are more specific than the catch-all', () => {
     const appleRules = DIRECTORY_RULES.filter(isAppleRule);

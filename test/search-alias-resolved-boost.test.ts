@@ -89,7 +89,9 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 15 (14→15 folds the resolved FTS configuration name, so rows written before a reindex-search-vector language switch become unreachable)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(15);
+  it('is 23 (20→21 recency fallback re-key #895; 21→22 result-stamp/injection epoch #1663 #3995 #3783 #4220; 22→23 excludePrivate posture fold #4352)', () => {
+    // mw2: 21→22 result-stamp/injection epoch (#1663 #3995 #3783 #4220).
+    // #4352 follow-up: 22→23 private-visibility posture fold (xp=).
+    expect(KNOBS_HASH_VERSION).toBe(23);
   });
 });

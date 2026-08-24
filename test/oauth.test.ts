@@ -231,7 +231,7 @@ describe('rescopeClient', () => {
     await expect(provider.rescopeClient(clientId, { sourceId: '../etc' })).rejects.toThrow('Invalid source_id');
     await expect(provider.rescopeClient(clientId, { federatedRead: ['ok', 'Not Valid!'] })).rejects.toThrow('Invalid source_id');
     await expect(provider.rescopeClient(clientId, { federatedRead: [] })).rejects.toThrow('cannot be empty');
-    await expect(provider.rescopeClient(clientId, {})).rejects.toThrow('requires --source, --federated-read, and/or --bound-slug-prefixes');
+    await expect(provider.rescopeClient(clientId, {})).rejects.toThrow('requires --source, --federated-read, --bound-slug-prefixes, and/or --surface');
     // v0.42.70.0: an explicit empty prefix list is ambiguous (deny-all) — rejected.
     await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [] })).rejects.toThrow('cannot be an empty list');
     // An empty/whitespace ENTRY matches every slug under startsWith — it would
@@ -590,6 +590,51 @@ describe('verifyAccessToken', () => {
 });
 
 // ---------------------------------------------------------------------------
+// #4043 — legacy access_tokens honor the scopes TEXT[] column (least
+// privilege). NULL (every pre-feature token) grandfathers to full access —
+// pinned above by 'legacy access_tokens fallback works'.
+// ---------------------------------------------------------------------------
+
+describe('#4043 legacy token scopes column', () => {
+  async function insertLegacyTokenWithScopes(name: string, scopesLiteral: string | null): Promise<string> {
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash, scopes)
+      VALUES (${crypto.randomUUID()}, ${name}, ${hash}, ${scopesLiteral}::text[])
+    `;
+    return token;
+  }
+
+  test("scopes ['read','write'] verifies with exactly those scopes (no admin)", async () => {
+    const token = await insertLegacyTokenWithScopes('scoped-harness-agent', '{read,write}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['read', 'write']);
+  });
+
+  test('explicit empty scopes array is preserved as deny-all', async () => {
+    const token = await insertLegacyTokenWithScopes('deny-all-agent', '{}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual([]);
+  });
+
+  test('unknown scope strings are filtered; all-unknown collapses to deny, not grandfather', async () => {
+    const token = await insertLegacyTokenWithScopes('typo-agent', '{reed,write}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['write']);
+    const token2 = await insertLegacyTokenWithScopes('all-typo-agent', '{reed,wright}');
+    const authInfo2 = await provider.verifyAccessToken(token2) as CoreAuthInfo;
+    expect(authInfo2.scopes).toEqual([]);
+  });
+
+  test('NULL scopes keeps the grandfathered full-access grant (byte-identical legacy behavior)', async () => {
+    const token = await insertLegacyTokenWithScopes('null-scopes-agent', null);
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['read', 'write', 'admin']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Token Revocation
 // ---------------------------------------------------------------------------
 
@@ -900,7 +945,11 @@ describe('operation scope annotations', () => {
     // is read-scoped for OAuth/MCP because its handler forces save/take off
     // for remote callers before persistence (pinned by
     // test/takes-mcp-allowlist.serial.test.ts); local CLI can still persist.
-    const remoteReadOnlyMutatingOps = new Set(['think']);
+    // WP4/D9: request_tools is read-scoped + mutating — its only write (the
+    // {surface} persist branch) self-enforces the D2 ceiling, the operator
+    // lock, and a per-client rate limit; the read scope keeps discovery
+    // available to every token class (agent scope via the FOV-4 carve-out).
+    const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools']);
     for (const op of operations) {
       if (op.mutating) {
         if (remoteReadOnlyMutatingOps.has(op.name)) {
@@ -1794,4 +1843,108 @@ describe('#1353 DCR default-grant hardening', () => {
     const stored = await insecure.clientsStore.getClient(reg.client_id);
     expect(stored?.grant_types).toEqual(['client_credentials']);
   });
+});
+
+// ---------------------------------------------------------------------------
+// #2833 — legacy last_used_at bookkeeping must not block or fail verification.
+// The legacy branch of verifyAccessToken used to AWAIT an un-debounced
+// `UPDATE access_tokens SET last_used_at = now()` on every verify: a slow or
+// failing UPDATE made every legacy-token request hang or 401, and every
+// verify burned a write. Post-fix it is a debounced (60s) fire-and-forget,
+// mirroring src/mcp/http-transport.ts validateToken.
+// ---------------------------------------------------------------------------
+
+describe('legacy last_used_at debounce (#2833)', () => {
+  async function insertLegacyToken(name: string): Promise<{ token: string; hash: string }> {
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash)
+      VALUES (${crypto.randomUUID()}, ${name}, ${hash})
+    `;
+    return { token, hash };
+  }
+
+  async function readLastUsedAt(hash: string): Promise<Date | null> {
+    const rows = await sql`SELECT last_used_at FROM access_tokens WHERE token_hash = ${hash}`;
+    const v = rows[0]?.last_used_at;
+    return v == null ? null : new Date(v as string | Date);
+  }
+
+  /** Poll until cond() or ~timeoutMs elapsed (fire-and-forget writes need a tick). */
+  async function waitFor(cond: () => Promise<boolean>, timeoutMs = 3000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await cond()) return true;
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return cond();
+  }
+
+  test('verify still resolves with valid auth when the last_used_at UPDATE rejects', async () => {
+    const { token } = await insertLegacyToken('debounce-reject-agent');
+    const rejectingSql: typeof sql = (strings, ...values) => {
+      const q = strings.join('?');
+      if (/UPDATE\s+access_tokens/i.test(q)) {
+        return Promise.reject(new Error('injected UPDATE failure'));
+      }
+      return sql(strings, ...values);
+    };
+    const p = new GBrainOAuthProvider({ sql: rejectingSql, tokenTtl: 60, refreshTtl: 300 });
+    const authInfo = await p.verifyAccessToken(token);
+    expect(authInfo.clientId).toBe('debounce-reject-agent');
+    expect(authInfo.scopes).toEqual(['read', 'write', 'admin']);
+  });
+
+  test('verify still resolves when the last_used_at UPDATE hangs forever', async () => {
+    const { token } = await insertLegacyToken('debounce-hang-agent');
+    const hangingSql: typeof sql = (strings, ...values) => {
+      const q = strings.join('?');
+      if (/UPDATE\s+access_tokens/i.test(q)) {
+        return new Promise(() => { /* never settles */ });
+      }
+      return sql(strings, ...values);
+    };
+    const p = new GBrainOAuthProvider({ sql: hangingSql, tokenTtl: 60, refreshTtl: 300 });
+    const authInfo = await p.verifyAccessToken(token);
+    expect(authInfo.clientId).toBe('debounce-hang-agent');
+  }, 10_000);
+
+  test('NULL last_used_at is populated on first verify (fire-and-forget)', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-null-agent');
+    expect(await readLastUsedAt(hash)).toBeNull();
+    await provider.verifyAccessToken(token);
+    const populated = await waitFor(async () => (await readLastUsedAt(hash)) !== null);
+    expect(populated).toBe(true);
+  }, 10_000);
+
+  test('fresh last_used_at (<60s old) is NOT rewritten on a second verify', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-fresh-agent');
+    await sql`
+      UPDATE access_tokens SET last_used_at = now() - interval '10 seconds'
+      WHERE token_hash = ${hash}
+    `;
+    const before = await readLastUsedAt(hash);
+    expect(before).not.toBeNull();
+    await provider.verifyAccessToken(token);
+    // Give any (buggy, un-debounced) write time to land.
+    await new Promise(r => setTimeout(r, 300));
+    const after = await readLastUsedAt(hash);
+    expect(after!.getTime()).toBe(before!.getTime());
+  }, 10_000);
+
+  test('stale last_used_at (>60s old) advances after a verify', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-stale-agent');
+    await sql`
+      UPDATE access_tokens SET last_used_at = now() - interval '2 hours'
+      WHERE token_hash = ${hash}
+    `;
+    const before = await readLastUsedAt(hash);
+    await provider.verifyAccessToken(token);
+    const advanced = await waitFor(async () => {
+      const cur = await readLastUsedAt(hash);
+      return cur !== null && cur.getTime() > before!.getTime();
+    });
+    expect(advanced).toBe(true);
+  }, 10_000);
 });
