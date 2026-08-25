@@ -28,7 +28,7 @@
         "heic-decode": "^2.1.0",
         "js-yaml": "^3.15.1",
         "jsonc-parser": "^3.3.1",
-        "marked": "^18.0.2",
+        "marked": "^18.0.9",
         "openai": "^4.0.0",
         "pgvector": "^0.2.0",
         "postgres": "^3.4.0",
