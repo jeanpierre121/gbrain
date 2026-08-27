@@ -1338,3 +1338,94 @@ describe('unrecognized_headings — folded speaker headings surface (#4136)', ()
     expect(messages.length).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// email-thread-heading (gbrain email collector thread pages)
+// ---------------------------------------------------------------------------
+
+describe('parseConversation — email-thread-heading (gbrain email collector)', () => {
+  const thread = [
+    '# Email thread: Oto - Caribou Renewal',
+    '## Juan Andrade &lt;juan@example.com&gt; — Thu, 18 Jun 2026 07:46:32 +0000 (sent)',
+    '',
+    '[Open in Gmail](https://mail.google.com/mail/u/?authuser=juan%40example.com#inbox/19ed9b2261e547a0)',
+    '',
+    'Hey Ed,',
+    '',
+    'Your renewal is due on 28 August 2026.',
+    '',
+    '## Edmund Farrar &lt;ed@example.com&gt; — Wed, 19 Aug 2026 08:03:59 +0100 (received)',
+    '',
+    'Hi Juan,',
+    '',
+    "I'd like to descope the agreement.",
+    '',
+    '## Product updates',
+    'Not a message heading.',
+    '',
+    '## Juan Andrade &lt;juan@example.com&gt; — Thu, 27 Aug 2026 15:56:24 +0000 (UTC) (sent)',
+    '',
+    'Aiming to send you something by tomorrow.',
+  ].join('\n');
+
+  test('parses per-message headings with RFC-2822 dates, offsets and direction', () => {
+    const r = parseConversation(thread, { fallbackDate: '2026-01-01' });
+    expect(r.matched_pattern_id).toBe('email-thread-heading');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0].speaker).toBe('Juan Andrade &lt;juan@example.com&gt;');
+    expect(r.messages[0].timestamp).toBe('2026-06-18T07:46:32.000Z');
+    expect(r.messages[0].direction).toBe('sent');
+    expect(r.messages[0].text).toContain('Your renewal is due on 28 August 2026.');
+    expect(r.messages[0].text).not.toContain('## Juan');
+    // +0100 converts to UTC.
+    expect(r.messages[1].timestamp).toBe('2026-08-19T07:03:59.000Z');
+    expect(r.messages[1].direction).toBe('received');
+    // A `## ` heading inside a body folds into the message text.
+    expect(r.messages[1].text).toContain('## Product updates');
+    // Trailing zone comment tolerated.
+    expect(r.messages[2].timestamp).toBe('2026-08-27T15:56:24.000Z');
+    expect(r.timezone_warning).toBeUndefined();
+  });
+
+  test('forcePatternId parses a single-message page the density scorer rejects', () => {
+    const single = [
+      '# Email thread: Quick note',
+      '## Juan Andrade &lt;juan@example.com&gt; — Thu, 18 Jun 2026 07:46:32 +0000 (sent)',
+      '',
+      ...Array.from({ length: 40 }, (_, i) => `Line ${i} of a long single message body.`),
+    ].join('\n');
+    const scored = parseConversation(single, { fallbackDate: '2026-01-01' });
+    expect(scored.matched_pattern_id).not.toBe('email-thread-heading');
+    const forced = parseConversation(single, {
+      fallbackDate: '2026-01-01',
+      forcePatternId: 'email-thread-heading',
+    });
+    expect(forced.matched_pattern_id).toBe('email-thread-heading');
+    expect(forced.phase).toBe('regex_match');
+    expect(forced.messages).toHaveLength(1);
+    expect(forced.messages[0].direction).toBe('sent');
+    expect(forced.messages[0].text).toContain('Line 39 of a long single message body.');
+  });
+
+  test('forcePatternId falls through to scoring when the forced pattern finds nothing', () => {
+    const chat = [
+      '**Alice Example** (2024-03-15 9:00 AM): morning',
+      '**Bob Example** (2024-03-15 9:01 AM): hey there',
+    ].join('\n');
+    const r = parseConversation(chat, { forcePatternId: 'email-thread-heading' });
+    expect(r.matched_pattern_id).toBe('imessage-slack');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].direction).toBeUndefined();
+  });
+
+  test('does not anchor headings that lack the direction marker', () => {
+    const body = [
+      '## Summary',
+      'Plain section.',
+      '## Juan Andrade &lt;juan@example.com&gt; — Thu, 18 Jun 2026 07:46:32 +0000',
+      'no marker on the heading above',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-01-01' });
+    expect(r.matched_pattern_id).not.toBe('email-thread-heading');
+  });
+});

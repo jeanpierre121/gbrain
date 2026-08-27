@@ -66,6 +66,7 @@
 
 import type { BrainEngine, NewFact } from '../core/engine.ts';
 import type { Page } from '../core/types.ts';
+import type { MatchedMessage } from '../core/conversation-parser/types.ts';
 import {
   extractFactsFromTurnWithOutcome,
   isFactsExtractionEnabled,
@@ -135,6 +136,44 @@ export const DEFAULT_SEGMENT_MAX_MESSAGES = 30;
 
 /** Minimum messages required for a segment to be worth extracting. */
 export const MIN_SEGMENT_MESSAGES = 2;
+
+/**
+ * Email threads: replies arrive over days, not minutes, so the episode gap is
+ * a week. Facts are dated at their segment's start (claim-time dating), so a
+ * wider gap would date a reply months early; a narrower one would fragment
+ * a normal back-and-forth. Episodes of a real thread are all kept, even a
+ * one-message episode (see the email branch in processPage).
+ */
+export const EMAIL_SEGMENT_GAP_MINUTES = 60 * 24 * 7;
+
+/**
+ * Rendered-body char budget per segment. Keeps every segment under
+ * SEGMENT_TEXT_CHAR_LIMIT with headroom for the header, so a long thread
+ * splits into more segments instead of losing its tail to truncation.
+ * Opt-in via SplitSegmentsOpts.maxChars (the email path); other types keep
+ * the historical message-count-only cut.
+ */
+export const DEFAULT_SEGMENT_MAX_CHARS = 5800;
+
+/** Pattern id the email path forces (see ParseConversationOpts.forcePatternId). */
+export const EMAIL_THREAD_PATTERN_ID = 'email-thread-heading';
+
+/**
+ * Senders whose messages carry no conversational facts: comment/notification
+ * relays, bounce and no-reply addresses, form submissions, job boards. Tested
+ * against the lowercased address (or the name when no address parsed) and
+ * dropped before segmenting, so a thread with one human reply keeps the
+ * human messages only.
+ */
+export const EMAIL_AUTOMATED_SENDERS: readonly RegExp[] = [
+  /(?:^|[._+-])(?:no-?reply|do-?not-?reply)@/,
+  /^(?:notifications?|notify|mailer-daemon|bounces?|postmaster|alerts?|calendar-notification)[@._+-]/,
+  /@docs\.google\.com$/,
+  /@calendar-server\.bounces\.google\.com$/,
+  /@mail\.zapier\.com$/,
+  /@webflow\.com$/,
+  /@jobsinnetwork\.com$/,
+];
 
 // #4136 — labels that are common DOCUMENT section headings, never lost
 // speakers. Gate the DECLINE only (a miss here is warn-noise on healthy
@@ -320,6 +359,8 @@ export interface ExtractConversationFactsCoreOpts {
    * if you need exact-ceiling compliance.
    */
   workers?: number;
+  /** Extractor chat model override (e.g. openai:gpt-5.6-sol). Default: facts.extraction_model, else the reasoning tier. */
+  model?: string;
   /**
    * Injectable per-segment extractor (BrainBench decision 15). When unset,
    * the production path is `extractFactsFromTurnWithOutcome` (fail-hard: a
@@ -342,6 +383,10 @@ export interface ExtractConversationFactsResult {
   pages_skipped_non_extractable: number;
   /** Durable scanned-not-extractable outcomes written by this run. */
   pages_marked_non_extractable: number;
+  /** Email pages with one inbound message, skipped before the durable lookup (never audited). */
+  pages_skipped_single_inbound_email: number;
+  /** Email messages dropped by EMAIL_AUTOMATED_SENDERS before segmenting. */
+  email_messages_dropped_automated: number;
   /** #4136 — pages declined because the winning heading pattern folded a
    *  speaker-shaped unrecognized heading and the parse had fewer than two
    *  distinct speakers (attribution would be wrong). Non-terminal: no
@@ -430,6 +475,14 @@ export function parseConversationMessages(
 export interface SplitSegmentsOpts {
   gapMinutes?: number;
   maxMessages?: number;
+  /**
+   * Rendered-body char budget per segment (see DEFAULT_SEGMENT_MAX_CHARS).
+   * Unset = no char cut. The segments on either side of a char cut may hold
+   * a lone message: both continue one conversation.
+   */
+  maxChars?: number;
+  /** Minimum messages for a segment to be kept. Default MIN_SEGMENT_MESSAGES. */
+  minMessages?: number;
   /** Drop messages with timestamp <= this ISO before splitting. */
   sinceIso?: string;
 }
@@ -440,6 +493,8 @@ export function splitIntoSegments(
 ): ConversationSegment[] {
   const gapMs = (opts.gapMinutes ?? DEFAULT_SEGMENT_GAP_MINUTES) * 60_000;
   const maxMessages = opts.maxMessages ?? DEFAULT_SEGMENT_MAX_MESSAGES;
+  const maxChars = opts.maxChars;
+  const minMessages = opts.minMessages ?? MIN_SEGMENT_MESSAGES;
   const sinceMs = opts.sinceIso ? Date.parse(opts.sinceIso) : NaN;
 
   const filtered = Number.isFinite(sinceMs)
@@ -449,9 +504,18 @@ export function splitIntoSegments(
   const out: ConversationSegment[] = [];
   let cur: ConversationMessage[] = [];
   let lastTs: number | null = null;
-
+  let curChars = 0;
+  // Both sides of a char cut continue one conversation, so neither side is
+  // held to the minimum: the closed segment already has a successor, the
+  // opened segment already has a predecessor.
+  let openedByCharCut = false;
+  let closingByCharCut = false;
   const flush = () => {
-    if (cur.length < MIN_SEGMENT_MESSAGES) {
+    const min = openedByCharCut || closingByCharCut ? 1 : minMessages;
+    openedByCharCut = false;
+    closingByCharCut = false;
+    curChars = 0;
+    if (cur.length < min) {
       cur = [];
       return;
     }
@@ -476,7 +540,14 @@ export function splitIntoSegments(
     const ts = Date.parse(m.timestamp);
     if (!Number.isFinite(ts)) continue;
     if (lastTs !== null && ts - lastTs > gapMs) flush();
+    const chars = renderedMessageChars(m);
+    if (maxChars !== undefined && cur.length > 0 && curChars + chars > maxChars) {
+      closingByCharCut = true;
+      flush();
+      openedByCharCut = true;
+    }
     cur.push(m);
+    curChars += chars;
     lastTs = ts;
     if (cur.length >= maxMessages) {
       flush();
@@ -509,6 +580,114 @@ export function renderSegmentForExtraction(
   // extractor still sees the topical anchor.
   const slack = SEGMENT_TEXT_CHAR_LIMIT - header.length - 16;
   return `${header}\n${body.slice(0, Math.max(0, slack))}\n…(truncated)`;
+}
+
+/** Chars one message occupies in renderSegmentForExtraction's body (line + newline). */
+function renderedMessageChars(m: ConversationMessage): number {
+  return m.speaker.length + m.timestamp.length + m.text.length + 6;
+}
+
+// ---------------------------------------------------------------------------
+// Email thread pages (collector format, see EMAIL_THREAD_PATTERN_ID).
+// ---------------------------------------------------------------------------
+
+const HTML_ENTITY_RE = /&(lt|gt|amp|quot|#39);/g;
+const HTML_ENTITY_MAP: Record<string, string> = {
+  lt: '<',
+  gt: '>',
+  amp: '&',
+  quot: '"',
+  '#39': "'",
+};
+function decodeEntities(s: string): string {
+  return s.replace(HTML_ENTITY_RE, (_, k: string) => HTML_ENTITY_MAP[k] ?? '');
+}
+const OPEN_IN_GMAIL_RE = /^\[Open in Gmail\]\([^)]*\)\s*$/;
+const EMAIL_SENT_HEADING_RE = /^##\s.*\(sent\)\s*$/m;
+
+export interface EmailSender {
+  name: string;
+  address: string | null;
+}
+
+/** Split the collector's HTML-escaped `Name <addr>` into display name + address. */
+export function parseEmailSender(raw: string): EmailSender {
+  const decoded = decodeEntities(raw).trim();
+  const m = /^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.exec(decoded);
+  if (m) {
+    const name = m[1].trim().replace(/^"(.*)"$/, '$1').trim();
+    return { name: name || m[2], address: m[2].toLowerCase() };
+  }
+  if (/^[^\s<>]+@[^\s<>]+$/.test(decoded)) {
+    return { name: decoded, address: decoded.toLowerCase() };
+  }
+  const name = decoded.replace(/^"(.*)"$/, '$1').trim();
+  return { name: name || 'unknown', address: null };
+}
+
+export function isAutomatedEmailSender(sender: EmailSender): boolean {
+  const probe = sender.address ?? sender.name.toLowerCase();
+  return EMAIL_AUTOMATED_SENDERS.some((re) => re.test(probe));
+}
+
+export interface NormalizedEmailMessages {
+  messages: MatchedMessage[];
+  /** Messages dropped because their sender is automated. */
+  dropped: number;
+  /** True when exactly one message remains and the brain owner sent it. */
+  soloSent: boolean;
+}
+
+/**
+ * Email-page post-parse normalization:
+ *   - speaker `Name &lt;addr&gt;` -> display name (the address only drives policy)
+ *   - automated senders dropped before segmenting
+ *   - `[Open in Gmail](...)` link lines stripped from bodies
+ */
+export function normalizeEmailMessages(
+  messages: readonly MatchedMessage[],
+): NormalizedEmailMessages {
+  const out: MatchedMessage[] = [];
+  let dropped = 0;
+  for (const m of messages) {
+    const sender = parseEmailSender(m.speaker);
+    if (isAutomatedEmailSender(sender)) {
+      dropped++;
+      continue;
+    }
+    const text = m.text
+      .split(/\r?\n/)
+      .filter((line) => !OPEN_IN_GMAIL_RE.test(line.trim()))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    out.push(
+      m.direction !== undefined
+        ? { speaker: sender.name, timestamp: m.timestamp, text, direction: m.direction }
+        : { speaker: sender.name, timestamp: m.timestamp, text },
+    );
+  }
+  return {
+    messages: out,
+    dropped,
+    soloSent: out.length === 1 && out[0].direction === 'sent',
+  };
+}
+
+/**
+ * Email pages with a single inbound message (newsletters, notifications,
+ * one-off sends to the owner) are out of scope for conversation facts. Cheap
+ * pre-parse check on frontmatter + the heading marker, so enumeration skips
+ * them for the cost of one list read and writes no durable audit row.
+ */
+export function isSingleInboundEmail(
+  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
+): boolean {
+  if (page.type !== 'email') return false;
+  const raw = page.frontmatter?.message_count;
+  const count = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? ''), 10);
+  if (!Number.isFinite(count) || count >= 2) return false;
+  return !EMAIL_SENT_HEADING_RE.test(page.compiled_truth ?? '');
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +920,8 @@ interface ExtractCoreState {
    * parser path.
    */
   llmFallbackModel: string | null;
+  /** Extractor chat model override (opts.model). */
+  model: string | null;
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -918,6 +1099,7 @@ async function processPage(
 ): Promise<{ newEndIso: string | null }> {
   const { page, body } = snapshot;
   state.result.pages_considered++;
+  const isEmail = page.type === 'email';
 
   // Body cap check first — pre-parse, pre-segment, pre-extraction.
   const bytes = pageBodyBytes(page);
@@ -935,7 +1117,10 @@ async function processPage(
   // `parseConversationMessages(body)` shape only saw the body, which
   // meant Telegram-bracket pages with frontmatter dates landed at
   // 1970-01-01. Now they pick up the correct date.
-  const parseResult = parseConversation(body, { page });
+  const parseResult = parseConversation(
+    body,
+    isEmail ? { page, forcePatternId: EMAIL_THREAD_PATTERN_ID } : { page },
+  );
   let messages = parseResult.messages;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
@@ -947,7 +1132,9 @@ async function processPage(
   // exactly this shape ([User, User] with the assistant's reply swallowed).
   // A multi-speaker page with folds is warn-only (residual risk, visible).
   // phase stays 'regex_match', so the LLM fallback gate below stays closed.
-  const foldedHeadings = parseResult.unrecognized_headings ?? [];
+  // Email anchors carry an explicit direction marker, so a folded `## ` line is
+  // body content (a forwarded newsletter section), never a lost speaker.
+  const foldedHeadings = isEmail ? [] : (parseResult.unrecognized_headings ?? []);
   const speakerShapedFolds = foldedHeadings.filter(isSpeakerShapedHeadingLabel);
   const declinedUnrecognizedSpeaker =
     speakerShapedFolds.length > 0 &&
@@ -995,8 +1182,24 @@ async function processPage(
       );
     }
   }
-  const allSegments = splitIntoSegments(messages);
-  const segments = splitIntoSegments(messages, { sinceIso });
+  let segmentOpts: SplitSegmentsOpts = {};
+  if (isEmail) {
+    const normalized = normalizeEmailMessages(messages);
+    state.result.email_messages_dropped_automated += normalized.dropped;
+    messages = normalized.messages;
+    // The thread is the conversation: once it has two human messages (or one
+    // the owner sent), every episode is worth extracting, including a lone
+    // reply weeks later. A single inbound message stays below the minimum.
+    const threadQualifies =
+      normalized.messages.length >= MIN_SEGMENT_MESSAGES || normalized.soloSent;
+    segmentOpts = {
+      gapMinutes: EMAIL_SEGMENT_GAP_MINUTES,
+      maxChars: DEFAULT_SEGMENT_MAX_CHARS,
+      minMessages: threadQualifies ? 1 : MIN_SEGMENT_MESSAGES,
+    };
+  }
+  const allSegments = splitIntoSegments(messages, segmentOpts);
+  const segments = splitIntoSegments(messages, { ...segmentOpts, sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
     if (
@@ -1090,6 +1293,7 @@ async function processPage(
         turnText: text,
         sessionId,
         source: PER_SEGMENT_SOURCE_PREFIX,
+        ...(state.model ? { model: state.model } : {}),
         engine: state.engine,
         abortSignal: state.signal,
       });
@@ -1294,6 +1498,8 @@ export async function runExtractConversationFactsCore(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
+    pages_skipped_single_inbound_email: 0,
+    email_messages_dropped_automated: 0,
     pages_skipped_unrecognized_speaker: 0,
     pages_failed: 0,
     pages_llm_fallback: 0,
@@ -1368,6 +1574,7 @@ export async function runExtractConversationFactsCore(
     extractor: opts.extractor,
     cpMap: new Map(),
     llmFallbackModel,
+    model: opts.model ?? null,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
@@ -1497,8 +1704,14 @@ export async function runExtractConversationFactsCore(
             offset,
           });
           if (batch.length === 0) break;
-
-          let claimable = batch;
+          // Email: single inbound messages are out of scope. Skip them before
+          // the durable lookup, so they cost one list read and no audit row.
+          const inboundSingles = batch.filter(isSingleInboundEmail);
+          if (inboundSingles.length > 0) {
+            state.result.pages_skipped_single_inbound_email += inboundSingles.length;
+          }
+          let claimable =
+            inboundSingles.length > 0 ? batch.filter((p) => !isSingleInboundEmail(p)) : batch;
           // Checkpoints are an intra-page cursor; fresh durable outcomes are
           // the page-level selection authority and survive checkpoint GC.
           if (!opts.force && claimable.length > 0) {
@@ -1751,6 +1964,8 @@ interface ParsedArgs {
   overrideDisabled?: boolean;
   /** v0.41.15.0 (D9): in-process parallel workers per source. */
   workers?: number;
+  /** --model: extractor chat model override for this run. */
+  model?: string;
   yes?: boolean;
   help?: boolean;
   error?: string;
@@ -1766,6 +1981,7 @@ function parseArgs(args: string[]): ParsedArgs {
     if (a === '--yes' || a === '-y') { out.yes = true; continue; }
     if (a === '--override-disabled') { out.overrideDisabled = true; continue; }
     if (a === '--slug') { out.slug = args[++i]; continue; }
+    if (a === '--model') { out.model = args[++i]; continue; }
     if (a === '--source-id') { out.sourceId = args[++i]; continue; }
     if (a === '--since') { out.sinceIso = args[++i]; continue; }
     if (a === '--types') {
@@ -1837,6 +2053,8 @@ Options:
                          Default: reads cycle.conversation_facts_backfill.types config
                          (falls back to the full allowlist).
   --slug <slug>          Process a single page (overrides multi-page enumeration).
+  --model <id>           Extractor chat model for this run (e.g. openai:gpt-5.6-sol).
+                         Default: facts.extraction_model, else the reasoning tier.
   --dry-run              Show segmentation + counts; no DB writes, no checkpoint advance.
   --limit <N>            Cap pages processed (default: all).
   --since <iso>          Only consider messages newer than this ISO timestamp.
@@ -1875,6 +2093,7 @@ function buildJobParams(args: string[]): Record<string, unknown> {
     types: parsed.types,
     slug: parsed.slug,
     dryRun: parsed.dryRun,
+    model: parsed.model,
     limit: parsed.limit,
     sinceIso: parsed.sinceIso,
     force: parsed.force,
@@ -1940,6 +2159,8 @@ export async function runExtractConversationFacts(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
+    pages_skipped_single_inbound_email: 0,
+    email_messages_dropped_automated: 0,
     pages_skipped_unrecognized_speaker: 0,
     pages_failed: 0,
     pages_llm_fallback: 0,
@@ -1970,6 +2191,7 @@ export async function runExtractConversationFacts(
         types: parsed.types,
         slug: parsed.slug,
         dryRun: parsed.dryRun,
+    model: parsed.model,
         limit: parsed.limit,
         sinceIso: parsed.sinceIso,
         force: parsed.force,
@@ -1988,6 +2210,8 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped_completed += perSource.pages_skipped_completed;
       aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
+      aggregate.pages_skipped_single_inbound_email += perSource.pages_skipped_single_inbound_email;
+      aggregate.email_messages_dropped_automated += perSource.email_messages_dropped_automated;
       aggregate.pages_skipped_unrecognized_speaker += perSource.pages_skipped_unrecognized_speaker;
       aggregate.pages_failed += perSource.pages_failed;
       aggregate.pages_llm_fallback += perSource.pages_llm_fallback;
@@ -2035,6 +2259,12 @@ export async function runExtractConversationFacts(
   }
   if (aggregate.pages_marked_non_extractable > 0) {
     console.log(`  Marked ${aggregate.pages_marked_non_extractable} page(s) as scanned, not extractable.`);
+  }
+  if (aggregate.pages_skipped_single_inbound_email > 0) {
+    console.log(`  Skipped ${aggregate.pages_skipped_single_inbound_email} email page(s) with a single inbound message (out of scope, not audited).`);
+  }
+  if (aggregate.email_messages_dropped_automated > 0) {
+    console.log(`  Dropped ${aggregate.email_messages_dropped_automated} email message(s) from automated senders before segmenting.`);
   }
   if (aggregate.pages_failed > 0) {
     console.error(`  Failed ${aggregate.pages_failed} page(s); they remain unfinished and will retry.`);

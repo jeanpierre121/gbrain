@@ -34,6 +34,12 @@ import {
   decodeCheckpointEntry,
   DEFAULT_SEGMENT_GAP_MINUTES,
   DEFAULT_SEGMENT_MAX_MESSAGES,
+  DEFAULT_SEGMENT_MAX_CHARS,
+  EMAIL_SEGMENT_GAP_MINUTES,
+  normalizeEmailMessages,
+  parseEmailSender,
+  isAutomatedEmailSender,
+  isSingleInboundEmail,
   SEGMENT_TEXT_CHAR_LIMIT,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
@@ -1676,5 +1682,166 @@ describe('#4136 folded speaker headings — decline gate is non-terminal', () =>
     expect(result.pages_skipped_unrecognized_speaker).toBe(0);
     expect(result.pages_processed).toBe(1);
     expect(result.segments_processed).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Email thread pages (email-thread-heading path).
+// ---------------------------------------------------------------------------
+
+describe('email thread normalization', () => {
+  const email = (
+    speaker: string,
+    timestamp: string,
+    text: string,
+    direction?: 'sent' | 'received',
+  ) => ({ speaker, timestamp, text, ...(direction ? { direction } : {}) });
+
+  test('parseEmailSender decodes entities and splits name/address', () => {
+    expect(parseEmailSender('Juan Andrade &lt;juan@example.com&gt;')).toEqual({
+      name: 'Juan Andrade',
+      address: 'juan@example.com',
+    });
+    expect(
+      parseEmailSender('"Frank Silva (Google Docs)" &lt;comments-noreply@docs.google.com&gt;'),
+    ).toEqual({ name: 'Frank Silva (Google Docs)', address: 'comments-noreply@docs.google.com' });
+    expect(parseEmailSender('ops@example.com')).toEqual({
+      name: 'ops@example.com',
+      address: 'ops@example.com',
+    });
+    expect(parseEmailSender('unknown')).toEqual({ name: 'unknown', address: null });
+  });
+
+  test('isAutomatedEmailSender matches relays, no-reply and form senders only', () => {
+    const auto = [
+      '"A (Google Docs)" &lt;comments-noreply@docs.google.com&gt;',
+      'Linear &lt;notifications@linear.app&gt;',
+      'Drive &lt;drive-shares-dm-noreply@google.com&gt;',
+      'Webflow &lt;no-reply@webflow.com&gt;',
+      'Zapier &lt;digest@mail.zapier.com&gt;',
+      'Google Calendar &lt;calendar-notification@google.com&gt;',
+    ];
+    for (const s of auto) expect(isAutomatedEmailSender(parseEmailSender(s))).toBe(true);
+    const human = [
+      'Edmund Farrar &lt;ed@example.com&gt;',
+      'Support &lt;support@example.com&gt;',
+      'Brianna (Superhuman Team) &lt;brianna@superhuman.com&gt;',
+      'unknown',
+    ];
+    for (const s of human) expect(isAutomatedEmailSender(parseEmailSender(s))).toBe(false);
+  });
+
+  test('normalizeEmailMessages renames speakers, drops automated senders, strips Gmail links', () => {
+    const r = normalizeEmailMessages([
+      email(
+        'Juan Andrade &lt;juan@example.com&gt;',
+        '2026-06-18T07:46:32.000Z',
+        '[Open in Gmail](https://mail.google.com/mail/u/?authuser=x#inbox/1)\n\nHey Ed,\n\n\n\nRenewal is due.',
+        'sent',
+      ),
+      email(
+        '"Frank Silva (Google Docs)" &lt;comments-noreply@docs.google.com&gt;',
+        '2026-06-19T07:46:32.000Z',
+        'Frank commented on the doc.',
+        'received',
+      ),
+      email('Edmund Farrar &lt;ed@example.com&gt;', '2026-08-19T07:03:59.000Z', 'Thanks.', 'received'),
+    ]);
+    expect(r.dropped).toBe(1);
+    expect(r.messages.map((m) => m.speaker)).toEqual(['Juan Andrade', 'Edmund Farrar']);
+    expect(r.messages[0].text).toBe('Hey Ed,\n\nRenewal is due.');
+    expect(r.messages[0].direction).toBe('sent');
+    expect(r.soloSent).toBe(false);
+  });
+
+  test('normalizeEmailMessages flags a lone owner-sent message', () => {
+    const r = normalizeEmailMessages([
+      email('Juan Andrade &lt;juan@example.com&gt;', '2026-06-18T07:46:32.000Z', 'Following up.', 'sent'),
+      email('Bot &lt;notifications@example.com&gt;', '2026-06-18T08:00:00.000Z', 'auto', 'received'),
+    ]);
+    expect(r.messages).toHaveLength(1);
+    expect(r.soloSent).toBe(true);
+    const inbound = normalizeEmailMessages([
+      email('Newsletter &lt;news@example.com&gt;', '2026-06-18T07:46:32.000Z', 'Read this.', 'received'),
+    ]);
+    expect(inbound.soloSent).toBe(false);
+  });
+
+  test('isSingleInboundEmail keys on frontmatter.message_count and the (sent) marker', () => {
+    const base = {
+      type: 'email' as const,
+      frontmatter: { message_count: 1 } as Record<string, unknown>,
+      compiled_truth:
+        '# Email thread: x\n## A &lt;a@b.c&gt; — Thu, 18 Jun 2026 07:46:32 +0000 (received)\n\nhi',
+    };
+    expect(isSingleInboundEmail(base)).toBe(true);
+    expect(
+      isSingleInboundEmail({ ...base, compiled_truth: base.compiled_truth.replace('(received)', '(sent)') }),
+    ).toBe(false);
+    expect(isSingleInboundEmail({ ...base, frontmatter: { message_count: '3' } })).toBe(false);
+    expect(isSingleInboundEmail({ ...base, frontmatter: {} })).toBe(false);
+    expect(isSingleInboundEmail({ ...base, type: 'slack' as const })).toBe(false);
+  });
+});
+
+describe('splitIntoSegments — email options', () => {
+  const msg = (i: number, timestamp: string, text = `m${i}`) => ({
+    speaker: i % 2 ? 'Bob' : 'Alice',
+    timestamp,
+    text,
+  });
+
+  test('email gap groups replies into week-scale episodes and keeps lone episodes', () => {
+    const msgs = [
+      msg(0, '2026-06-18T07:46:32.000Z'),
+      msg(1, '2026-06-20T09:00:00.000Z'),
+      msg(2, '2026-08-19T07:03:59.000Z'),
+      msg(3, '2026-08-24T15:56:24.000Z'),
+    ];
+    // Default 30-minute gap: four lone messages, all below the minimum.
+    expect(splitIntoSegments(msgs)).toHaveLength(0);
+    // Email gap alone: two episodes, the lone August pair survives on its own.
+    const segs = splitIntoSegments(msgs, { gapMinutes: EMAIL_SEGMENT_GAP_MINUTES, minMessages: 1 });
+    expect(segs).toHaveLength(2);
+    expect(segs[0].messages).toHaveLength(2);
+    expect(segs[0].startIso).toBe('2026-06-18T07:46:32.000Z');
+    expect(segs[1].messages).toHaveLength(2);
+    // The August episode is dated when it happened, not at the thread start.
+    expect(segs[1].startIso).toBe('2026-08-19T07:03:59.000Z');
+    // A reply more than a week later forms its own one-message episode.
+    const late = [...msgs, msg(4, '2026-10-01T10:00:00.000Z')];
+    const segs2 = splitIntoSegments(late, { gapMinutes: EMAIL_SEGMENT_GAP_MINUTES, minMessages: 1 });
+    expect(segs2).toHaveLength(3);
+    expect(segs2[2].messages).toHaveLength(1);
+  });
+
+  test('maxChars splits a long thread instead of leaving it to truncation', () => {
+    const long = 'x'.repeat(2000);
+    const msgs = Array.from({ length: 6 }, (_, i) => msg(i, `2026-06-18T0${i}:00:00.000Z`, long));
+    const segs = splitIntoSegments(msgs, {
+      gapMinutes: EMAIL_SEGMENT_GAP_MINUTES,
+      maxChars: DEFAULT_SEGMENT_MAX_CHARS,
+    });
+    expect(segs.length).toBeGreaterThan(1);
+    for (const s of segs) {
+      expect(renderSegmentForExtraction('t', s).endsWith('…(truncated)')).toBe(false);
+    }
+    expect(segs.reduce((n, s) => n + s.messages.length, 0)).toBe(6);
+  });
+
+  test('a lone message after a char cut is kept (it continues the conversation)', () => {
+    const long = 'x'.repeat(3000);
+    const msgs = Array.from({ length: 3 }, (_, i) => msg(i, `2026-06-18T0${i}:00:00.000Z`, long));
+    const segs = splitIntoSegments(msgs, {
+      gapMinutes: EMAIL_SEGMENT_GAP_MINUTES,
+      maxChars: DEFAULT_SEGMENT_MAX_CHARS,
+    });
+    expect(segs.reduce((n, s) => n + s.messages.length, 0)).toBe(3);
+  });
+
+  test('minMessages 1 keeps a lone message', () => {
+    const one = [msg(0, '2026-06-18T07:46:32.000Z')];
+    expect(splitIntoSegments(one)).toHaveLength(0);
+    expect(splitIntoSegments(one, { minMessages: 1 })).toHaveLength(1);
   });
 });

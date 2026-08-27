@@ -220,6 +220,8 @@ export async function runPhaseConversationFactsBackfill(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
+    pages_skipped_single_inbound_email: 0,
+    email_messages_dropped_automated: 0,
     pages_skipped_unrecognized_speaker: 0,
     pages_failed: 0,
     pages_llm_fallback: 0,

@@ -40,6 +40,12 @@ export interface MatchedMessage {
    *  formats when no frontmatter date is available. */
   timestamp: string;
   text: string;
+  /**
+   * Message direction when the pattern captures it (`direction_group`).
+   * Email-thread pages mark each message `(sent)` by the brain owner or
+   * `(received)`; callers use it to keep an owner-sent single message.
+   */
+  direction?: 'sent' | 'received';
 }
 
 /**
@@ -128,6 +134,11 @@ export interface CaptureMap {
   hour_group?: number;
   minute_group?: number;
   ampm_group?: number;
+  /**
+   * Optional capture whose value is `sent` or `received`. Surfaces as
+   * `MatchedMessage.direction`; any other value is ignored.
+   */
+  direction_group?: number;
 }
 
 /**
@@ -260,6 +271,14 @@ export interface ParseConversationOpts {
   diagnostic?: boolean;
   /** When true, skip LLM polish even if config enables it. */
   noPolish?: boolean;
+  /**
+   * Apply this pattern id first, without scoring. Callers that know the
+   * page format (the email collector's thread pages) use it so a page with
+   * a single anchored heading is not rejected by the density scorer. Falls
+   * through to normal scoring when the id is unknown or the forced pattern
+   * yields no messages.
+   */
+  forcePatternId?: string;
   /** When true, skip LLM fallback even if config enables it. */
   noFallback?: boolean;
   /** Caller-supplied patterns to add (e.g. user simple_pattern compiled). */

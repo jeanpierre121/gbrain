@@ -175,6 +175,16 @@ function buildIso(
 ): string | null {
   const { captures } = entry;
 
+  // Generic rfc2822 path: the pattern captures the whole date string and
+  // Date.parse handles day names, numeric offsets and a trailing zone comment
+  // (`Thu, 18 Jun 2026 07:46:32 +0100`, `... +0000 (UTC)`). The offset is
+  // honored, so the ISO output is true UTC — no timezone assumption.
+  if (entry.time_format === 'rfc2822' && captures.date_group !== undefined) {
+    const raw = match[captures.date_group];
+    const ms = typeof raw === 'string' ? Date.parse(raw.trim()) : Number.NaN;
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+
   // Pattern-specific date reconstruction.
   switch (entry.id) {
     case 'telegram-text-export': {
@@ -411,7 +421,17 @@ export function applyPattern(
       // Multi-line patterns: text on next line(s) until next anchor.
       // (Even when text_group is set, multi_line=true means SUBSEQUENT
       // non-anchor lines also absorb into this message's body.)
-      out.push({ speaker, timestamp: iso, text });
+      const dirRaw =
+        entry.captures.direction_group !== undefined
+          ? m[entry.captures.direction_group]
+          : undefined;
+      const direction =
+        dirRaw === 'sent' || dirRaw === 'received' ? dirRaw : undefined;
+      out.push(
+        direction !== undefined
+          ? { speaker, timestamp: iso, text, direction }
+          : { speaker, timestamp: iso, text },
+      );
     } else {
       // Passed quick_reject but failed the full regex (e.g. '## Assistant
       // Bot' against the closed-set heading pattern) — the OTHER fold site.
@@ -582,6 +602,28 @@ export function parseConversation(
 
   if (candidates.length === 0) {
     return { messages: [], phase: 'no_match' };
+  }
+
+  // Caller-known format: apply the named pattern directly. The density
+  // scorer would reject a long single-message page (one anchor among many
+  // lines), which is exactly the owner-sent email case. Fall through to
+  // scoring if the pattern is unknown or finds nothing.
+  if (opts.forcePatternId) {
+    const forced = candidates.find((p) => p.id === opts.forcePatternId);
+    if (forced) {
+      const diag = { unrecognized_headings: [] as string[] };
+      const messages = applyPattern(body, forced, dateCtx, diag);
+      if (messages.length > 0) {
+        return {
+          messages,
+          phase: 'regex_match',
+          matched_pattern_id: forced.id,
+          patterns_scored: 0,
+          unrecognized_headings:
+            diag.unrecognized_headings.length > 0 ? diag.unrecognized_headings : undefined,
+        };
+      }
+    }
   }
 
   // D18: score every candidate; pick the highest. Tie-break on
