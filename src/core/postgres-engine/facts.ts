@@ -311,6 +311,7 @@ export async function listFactsByEntity(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const excludeAuditRows = opts?.excludeAuditRows === true;
@@ -319,6 +320,7 @@ export async function listFactsByEntity(
       WHERE source_id = ${source_id}
         AND entity_slug = ${entitySlug}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
@@ -338,6 +340,7 @@ export async function listFactsSince(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const entitySlug = opts?.entitySlug ?? null;
@@ -349,6 +352,7 @@ export async function listFactsSince(
         AND ${eventTime ? sql`COALESCE(valid_from, created_at)` : sql`created_at`} >= ${since}
         ${entitySlug ? sql`AND entity_slug = ${entitySlug}` : sql``}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
@@ -368,6 +372,7 @@ export async function listFactsBySession(
     const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
     const offset = Math.max(0, opts?.offset ?? 0);
     const activeOnly = opts?.activeOnly !== false;
+    const unconsolidatedOnly = opts?.unconsolidatedOnly === true;
     const kinds = (opts?.kinds && opts.kinds.length > 0) ? opts.kinds : null;
     const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
     const excludeAuditRows = opts?.excludeAuditRows === true;
@@ -376,6 +381,7 @@ export async function listFactsBySession(
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
         ${activeOnly ? sql`AND expired_at IS NULL` : sql``}
+        ${unconsolidatedOnly ? sql`AND consolidated_at IS NULL` : sql``}
         ${kinds ? sql`AND kind = ANY(${kinds}::text[])` : sql``}
         ${visibility ? sql`AND visibility = ANY(${visibility}::text[])` : sql``}
         ${excludeAuditRows ? sql`AND source != ALL(${AUDIT_ROW_SOURCES}::text[])` : sql``}
