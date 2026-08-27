@@ -1692,6 +1692,12 @@ export async function runExtractConversationFactsCore(
       let processedPagesCount = 0;
       pageLoop: for (const type of concreteTypes) {
         let offset = 0;
+        // Claim buffer: a batch is an enumeration unit, not a work unit. After
+        // the scope + durable filters a 10-page batch may hold two claimable
+        // pages, and running the pool per batch caps effective parallelism at
+        // that (measured: ~5 in-flight pages at --workers 16 on the email
+        // corpus). Fill the pool before running it.
+        let pending: Page[] = [];
         // eslint-disable-next-line no-constant-condition
         while (true) {
           if (signal?.aborted) throw new Error('aborted');
@@ -1703,7 +1709,7 @@ export async function runExtractConversationFactsCore(
             limit: PAGE_LIST_BATCH,
             offset,
           });
-          if (batch.length === 0) break;
+          if (batch.length === 0 && pending.length === 0) break;
           // Email: single inbound messages are out of scope. Skip them before
           // the durable lookup, so they cost one list read and no audit row.
           const inboundSingles = batch.filter(isSingleInboundEmail);
@@ -1728,17 +1734,27 @@ export async function runExtractConversationFactsCore(
             });
           }
 
+          pending.push(...claimable);
+          offset += batch.length;
+          const lastBatch = batch.length < PAGE_LIST_BATCH;
+          const limitReached = opts.limit
+            ? processedPagesCount + pending.length >= opts.limit
+            : false;
+          if (pending.length < workers * 2 && !lastBatch && !limitReached) continue;
+
           // Apply --limit after durable filtering. The limit caps pages that
           // need work, not already-completed pages scanned to find that work.
+          let work = pending;
+          pending = [];
           if (opts.limit) {
             const remaining = opts.limit - processedPagesCount;
-            if (remaining < claimable.length) {
-              claimable = claimable.slice(0, remaining);
+            if (remaining < work.length) {
+              work = work.slice(0, remaining);
             }
           }
 
           const poolResult = await runSlidingPool({
-            items: claimable,
+            items: work,
             workers,
             signal,
             onItem: (page) => processPageWithLock(page),
@@ -1765,9 +1781,8 @@ export async function runExtractConversationFactsCore(
             );
           }
 
-          processedPagesCount += claimable.length;
-          offset += batch.length;
-          if (batch.length < PAGE_LIST_BATCH) break;
+          processedPagesCount += work.length;
+          if (lastBatch) break;
 
           // Persist checkpoint between batches so a crash mid-walk
           // doesn't lose all progress.
