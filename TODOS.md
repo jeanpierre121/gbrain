@@ -6234,29 +6234,13 @@ keeping both skills' triggers intact for chaining.
 **Priority:** P3
 **Depends on:** None.
 
-### Config-driven email sender denylist
+### Config-driven email sender denylist — DONE 2026-08-28 (PR #4681)
 
-**What:** `facts.email.sender_denylist` config key merged with the generic patterns in `EMAIL_AUTOMATED_SENDERS`, so Caribou-specific domains (`webflow.com`, `jobsinnetwork.com`, `mail.zapier.com`) leave the generic file and a human at Webflow is not dropped.
+**Done:** `facts.email_automated_senders` (JSON array of regex sources, compiled case-insensitively, invalid patterns reported and skipped) merges with `EMAIL_AUTOMATED_SENDERS` at core start; `runExtractConversationFactsCore` also takes `opts.emailAutomatedSenders`. Shipped in the upstream carve (`feat/email-thread-facts`), not yet on this fork branch (see "Adopt the upstream carve on run/full-facts").
 
-**Why:** Caribou data lives inside fork code that may be upstreamed.
+### Upstream PR: email-thread parsing + async pool — OPENED 2026-08-28 as garrytan/gbrain#4681
 
-**Context:** `EMAIL_AUTOMATED_SENDERS` in src/commands/extract-conversation-facts.ts. Decision D2c of ~/gbrain-email-facts-plan.md.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None. Do before any upstream PR.
-
-### Upstream PR: email-thread parsing + async pool
-
-**What:** The generic parts of the 2026-08-27/28 email-facts change as one or two PRs to garrytan/gbrain: `email-thread-heading` builtin, rfc2822 date path + zone fallback, direction capture, `forcePatternId`, async-iterable `runSlidingPool`, `SplitSegmentsOpts.maxChars/minMessages`, `--model` + jobs.ts round trip, message chunking.
-
-**Why:** The fork carry grew by ~700 lines across 6 source files and conflicts with every upstream release; the pattern is generic (the LLM fallback prompt already lists `email-thread`).
-
-**Context:** Fork jeanpierre121/gbrain, branch run/full-facts (not pushed). Prior PRs #2341/#2357/#2427 landed.
-
-**Effort:** M
-**Priority:** P2
-**Depends on:** Config-driven denylist; 7A tests; T1/T2 implementation.
+**State:** carve branch `feat/email-thread-facts` (7 commits off origin/master c860a411, +3.1k/-165, 24 files) in the worktree `~/gbrain-pr-email` (node_modules symlinked to `~/gbrain`), pushed to `jeanpierre121/gbrain`. Two review cycles (5 CRITICAL fixed: ReDoS in the email regex, unscoped canonicalizer lookup, char-cut minimum bypass, producer error escaping the pool, keyset cursor precision). Watch the PR for the train's absorption; then merge upstream into run/full-facts and drop the fork's older versions of these files.
 
 ### Private facts unreadable over the stdio MCP server
 
@@ -6281,6 +6265,56 @@ keeping both skills' triggers intact for chaining.
 **Effort:** M
 **Priority:** P2
 **Depends on:** None.
+
+### Adopt the upstream carve on run/full-facts
+
+**What:** Bring `feat/email-thread-facts` (PR #4681) into `run/full-facts`, replacing the fork's earlier versions of worker-pool.ts, the engines' keyset predicate, the parser email pattern and extract-conversation-facts.ts.
+
+**Why:** The fork (and Modal, via vendor rsync) still runs the pre-review code: the polynomial email regex (1.5 s per 2,000-space body line, attacker-controlled), the millisecond-bucket keyset predicate with a raw-column ORDER BY (can skip a page at a batch boundary inside one millisecond), the pool that leaves siblings running detached after a producer error, the canonicalizer that folds across sources, and the char-cut exemption that manufactures the segment minimum for a lone oversized message. Pass 1 is done, but the nightly cycle keeps calling the same core.
+
+**How:** either merge the carve branch (conflicts in the five reworked files: take the carve's version, then re-apply the fork-only bits: reader-trust bullets in KEY_FILES.md, the operations.ts import removal) or wait for the train to absorb #4681 and merge upstream. Then rsync + `modal deploy` (see the brain-plane runbook) and re-run `bun run test` with the fork's env guard.
+
+**Depends on:** #4681 absorbed, or a manual merge.
+
+### Persist the keyset cursor between extraction runs
+
+**What:** Store the `(updated_at_iso, slug)` keyset of the last claimed page in the op checkpoint (`recordCompleted` payload) and resume from it on the next run; reset it when a walk completes.
+
+**Why:** The walk is oldest-updated first and restarts from the oldest page every run. Under the nightly cycle's 20-minute walltime, a large never-extracted backlog delays the newest threads; `--limit N` means the N oldest claimable pages. Decided 2026-08-28 (ship D3): keep the order, document it, make the walk resumable as a follow-up.
+
+**Depends on:** #4681 (the `updated_at_iso` projection).
+
+### `delta` verb: resume from `updated_at_iso`
+
+**What:** `src/core/context/turn-context.ts` feeds a JS Date back as the `updatedAfterKeyset` cursor; switch it to `Page.updated_at_iso` like the extractor.
+
+**Why:** The same millisecond-cursor bug the email run hit (last row re-selected, same-millisecond batches never advance). Upstream code; fix there once #4681 lands.
+
+**Depends on:** #4681.
+
+### Email collector: escape body lines that look like a heading
+
+**What:** In `~/brain` `email-collector.mjs`, escape a leading `#` on body lines (as `escapeMd` already does for `<` `>` `[` `]`).
+
+**Why:** An inbound email whose body contains `## Sam Example &lt;sam@...&gt; — <date> (sent)` renders indistinguishably from a real heading and forges an owner-sent message (adversarial review finding 3). The parser cannot tell them apart; the collector can. Until then the direction marker is rendered into the extractor line, so the LLM sees `[received]` on inbound text, but a forged `(sent)` line would still pass.
+
+**Depends on:** nothing (fork collector, not gbrain).
+
+### `--since` plus a changed page deletes the page's earlier facts
+
+**What:** `deleteOrphanFactsForPage` runs before re-extraction; with `--since`, only the tail is re-extracted and the terminal row is written, so the earlier facts are gone until `--force`.
+
+**Why:** Pre-existing interplay in upstream, but the hourly email collector appends replies, so email pages hit it. Either re-extract the whole page when its content hash changed, or scope the delete to `valid_from >= since`.
+
+**Depends on:** upstream design call; raise on #4681 or a follow-up issue.
+
+### Scoring path is quadratic on multi-kilobyte whitespace runs
+
+**What:** With no `forcePatternId`, `parseConversation` scores every builtin; several pre-existing patterns (`\s+` next to lazy groups, `UNRECOGNIZED_HEADING_RE`) take 450 ms on one 20,000-space line and scale quadratically.
+
+**Why:** Email pages always force their pattern (0.1 ms), but any other page type with attacker-influenced bodies (slack, meeting transcripts) takes the scored path. A line-length bound for anchor candidacy that still admits long single-line messages is the open question.
+
+**Depends on:** nothing; upstream parser.
 
 ## Completed
 
