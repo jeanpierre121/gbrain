@@ -283,8 +283,9 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
     );
   } finally {
     if (opts.signal) opts.signal.removeEventListener('abort', onCallerAbort);
-    // Close a generator that still has items (abort or must-abort exit) so
-    // its finally blocks run and no producer is left suspended.
+    // Close the generator on every exit path (abort, must-abort, or plain
+    // exhaustion): a no-op when it already finished, and it runs the
+    // producer's finally blocks when it did not.
     if (iterator && typeof iterator.return === 'function') {
       try { await iterator.return(undefined); } catch { /* producer cleanup is best-effort */ }
     }

@@ -4,7 +4,6 @@
  */
 
 import { verbOperations, MEMORY_VERBS_VERSION } from './verbs.ts';
-import { readableFactVisibilities } from './facts/reader-trust.ts';
 export { MEMORY_VERBS_VERSION };
 
 // --- Foundation (pure move, v0.46.x): the contract types + error envelope live
