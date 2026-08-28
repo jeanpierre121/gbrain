@@ -2005,7 +2005,9 @@ export class PGLiteEngine implements BrainEngine {
       params.push(filters.updatedAfterKeyset.slug);
       const slugIdx = params.length;
       where.push(
-        `(p.updated_at > $${tsIdx}::timestamptz OR (p.updated_at = $${tsIdx}::timestamptz AND p.slug > $${slugIdx}))`,
+        // Millisecond-bucket keyset: see the Postgres engine for the rationale
+        // (the cursor is a JS Date, the column stores microseconds).
+        `(p.updated_at >= $${tsIdx}::timestamptz + interval '1 millisecond' OR (p.updated_at >= $${tsIdx}::timestamptz AND p.updated_at < $${tsIdx}::timestamptz + interval '1 millisecond' AND p.slug > $${slugIdx}))`,
       );
     } else if (filters?.updated_after) {
       params.push(filters.updated_after);

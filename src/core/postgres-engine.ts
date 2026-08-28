@@ -1026,7 +1026,13 @@ export class PostgresEngine implements BrainEngine {
     // v0.45.7 keyset (updated_at, slug) supersedes updated_after when set.
     const keyset = filters?.updatedAfterKeyset;
     const updatedCondition = keyset
-      ? sql`AND (p.updated_at > ${keyset.updatedAt}::timestamptz OR (p.updated_at = ${keyset.updatedAt}::timestamptz AND p.slug > ${keyset.slug}))`
+      // The cursor comes from a JS Date (millisecond precision) while the
+      // column stores microseconds, so the tiebreak bucket is the cursor's
+      // whole millisecond: rows in that millisecond order by slug, rows in a
+      // later millisecond come after. A strict `>` on the raw column would
+      // re-select the last row of every batch (and stall on a batch of
+      // same-millisecond rows). Range form keeps the updated_at index usable.
+      ? sql`AND (p.updated_at >= ${keyset.updatedAt}::timestamptz + interval '1 millisecond' OR (p.updated_at >= ${keyset.updatedAt}::timestamptz AND p.updated_at < ${keyset.updatedAt}::timestamptz + interval '1 millisecond' AND p.slug > ${keyset.slug}))`
       : updatedAfter
         ? sql`AND p.updated_at > ${updatedAfter}::timestamptz`
         : sql``;
