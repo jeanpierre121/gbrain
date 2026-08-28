@@ -42,7 +42,7 @@
  *
  *     Email thread pages (type `email`, collector format) take this path:
  *
- *       listPages(keyset) ──► isSingleInboundEmail? ──skip──► (counted, no audit row)
+ *       listPages(keyset) ──► isOutOfScopeEmail? ──skip──► (counted, no audit row)
  *            │ candidates                     │ keep
  *            ▼                                ▼
  *       findFreshExtractionOutcomes ──done──► skip (durable)
@@ -413,7 +413,7 @@ export interface ExtractConversationFactsResult {
   pages_skipped_non_extractable: number;
   /** Durable scanned-not-extractable outcomes written by this run. */
   pages_marked_non_extractable: number;
-  /** Email pages with one inbound message, skipped before the durable lookup (never audited). */
+  /** Out-of-scope email pages (single inbound message, digest subtype) skipped before the durable lookup (never audited). */
   pages_skipped_single_inbound_email: number;
   /** Email messages dropped by EMAIL_AUTOMATED_SENDERS before segmenting. */
   email_messages_dropped_automated: number;
@@ -756,6 +756,22 @@ export function isSingleInboundEmail(
   const count = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? ''), 10);
   if (!Number.isFinite(count) || count >= 2) return false;
   return !EMAIL_SENT_HEADING_RE.test(page.compiled_truth ?? '');
+}
+
+/**
+ * Email pages the facts pipeline never extracts: the collector's daily digest
+ * pages (`frontmatter.subtype` other than `thread`, e.g. `digest`, whose body
+ * is `## Signatures pending` / `## Triage` sections, not messages) and single
+ * inbound messages. Enumeration skips both before parsing and writes no
+ * audit row.
+ */
+export function isOutOfScopeEmail(
+  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
+): boolean {
+  if (page.type !== 'email') return false;
+  const subtype = page.frontmatter?.subtype;
+  if (typeof subtype === 'string' && subtype !== 'thread') return true;
+  return isSingleInboundEmail(page);
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,10 +1898,11 @@ export async function runExtractConversationFactsCore(
               keyset = { updatedAt: new Date(last.updated_at).toISOString(), slug: last.slug };
             }
             exhausted = batch.length < PAGE_LIST_BATCH;
-            // Email: single inbound messages are out of scope. Skip them before
-            // the durable lookup, so they cost one list read and no audit row.
+            // Email: digest pages and single inbound messages are out of scope.
+            // Skip them before the durable lookup, so they cost one list read
+            // and no audit row.
             for (const page of batch) {
-              if (isSingleInboundEmail(page)) state.result.pages_skipped_single_inbound_email++;
+              if (isOutOfScopeEmail(page)) state.result.pages_skipped_single_inbound_email++;
               else candidates.push(page);
             }
             if (candidates.length < candidateBatch && !exhausted) continue;
@@ -2436,7 +2453,7 @@ export async function runExtractConversationFacts(
     console.log(`  Marked ${aggregate.pages_marked_non_extractable} page(s) as scanned, not extractable.`);
   }
   if (aggregate.pages_skipped_single_inbound_email > 0) {
-    console.log(`  Skipped ${aggregate.pages_skipped_single_inbound_email} email page(s) with a single inbound message (out of scope, not audited).`);
+    console.log(`  Skipped ${aggregate.pages_skipped_single_inbound_email} out-of-scope email page(s) (single inbound message or digest; not audited).`);
   }
   if (aggregate.email_messages_dropped_automated > 0) {
     console.log(`  Dropped ${aggregate.email_messages_dropped_automated} email message(s) from automated senders before segmenting.`);

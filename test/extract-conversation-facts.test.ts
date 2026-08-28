@@ -44,6 +44,7 @@ import {
   EntitySlugCanonicalizer,
   isAutomatedEmailSender,
   isSingleInboundEmail,
+  isOutOfScopeEmail,
   SEGMENT_TEXT_CHAR_LIMIT,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
@@ -1771,6 +1772,19 @@ describe('email thread normalization', () => {
     expect(inbound.soloSent).toBe(false);
   });
 
+  test('isOutOfScopeEmail also drops digest pages (subtype other than thread)', () => {
+    const digest = {
+      type: 'email' as const,
+      frontmatter: { subtype: 'digest', message_count: 28 } as Record<string, unknown>,
+      compiled_truth: '# Email digest — 2026-08-09\n\n## Signatures pending (0)\n\n## Triage (3)',
+    };
+    expect(isOutOfScopeEmail(digest)).toBe(true);
+    expect(isOutOfScopeEmail({ ...digest, frontmatter: { subtype: 'thread', message_count: 3 } })).toBe(false);
+    // No subtype at all: fall back to the single-inbound rule only.
+    expect(isOutOfScopeEmail({ ...digest, frontmatter: { message_count: 3 } })).toBe(false);
+    expect(isOutOfScopeEmail({ ...digest, frontmatter: { message_count: 1 } })).toBe(true);
+  });
+
   test('isSingleInboundEmail keys on frontmatter.message_count and the (sent) marker', () => {
     const base = {
       type: 'email' as const,
@@ -2031,6 +2045,13 @@ describe('email pages through runExtractConversationFactsCore', () => {
       ].join('\n'),
       frontmatter: { subject: 'Weekly digest', message_count: 1 },
     });
+    // (5) A daily digest page: same `email` type, digest format, out of scope.
+    await engine.putPage('email-2026-08-09', {
+      type: 'email' as never,
+      title: 'Email digest — 2026-08-09',
+      compiled_truth: '# Email digest — 2026-08-09\n\n## Signatures pending (0)\n\n## Triage (3)\n\n- something',
+      frontmatter: { subtype: 'digest', message_count: 28 },
+    });
     // (4) Two messages, both automated: parses, normalizes to nothing, audited.
     await engine.putPage('email-thread-ddd4', {
       type: 'email' as never,
@@ -2071,7 +2092,8 @@ describe('email pages through runExtractConversationFactsCore', () => {
       },
     });
     expect(result.pages_processed).toBe(2);
-    expect(result.pages_skipped_single_inbound_email).toBe(1);
+    // The inbound single and the digest page: skipped before any durable write.
+    expect(result.pages_skipped_single_inbound_email).toBe(2);
     expect(result.pages_marked_non_extractable).toBe(1);
     expect(result.email_messages_dropped_automated).toBe(3);
     expect(result.facts_inserted).toBe(6);
@@ -2096,8 +2118,9 @@ describe('email pages through runExtractConversationFactsCore', () => {
     expect(terminal).toEqual(['email-thread-aaa1', 'email-thread-bbb2']);
     const audited = rows.filter((r) => r.source === 'cli:extract-conversation-facts:non-extractable:v2').map((r) => r.source_markdown_slug);
     expect(audited).toEqual(['email-thread-ddd4']);
-    // Never audited: the inbound single is skipped before any durable write.
+    // Never audited: the inbound single and the digest are skipped before any durable write.
     expect(rows.some((r) => r.source_markdown_slug === 'email-thread-ccc3')).toBe(false);
+    expect(rows.some((r) => r.source_markdown_slug === 'email-2026-08-09')).toBe(false);
   });
 
   test('a second run skips both completed pages via durable outcomes and re-skips the inbound single', async () => {
@@ -2110,7 +2133,7 @@ describe('email pages through runExtractConversationFactsCore', () => {
     expect(result.pages_processed).toBe(0);
     expect(result.pages_skipped_completed).toBe(2);
     expect(result.pages_skipped_non_extractable).toBe(1);
-    expect(result.pages_skipped_single_inbound_email).toBe(1);
+    expect(result.pages_skipped_single_inbound_email).toBe(2);
   });
 });
 
