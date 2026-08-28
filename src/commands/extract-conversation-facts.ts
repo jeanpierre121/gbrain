@@ -31,10 +31,39 @@
  *   - Strict per-source core. `runExtractConversationFactsCore` ALWAYS
  *     takes one sourceId. Multi-source iteration lives in the CLI
  *     wrapper (and in the cycle phase wrapper, separately).
- *   - Two-phase memory-bounded enumeration. Use paginated
- *     `listPages({type, sourceId, limit: PAGE_LIST_BATCH})` so worst
- *     case is BATCH × 25MB per batch (currently 10 × 25MB = 250MB
- *     bounded). Per-page body cap drops oversize before parsing.
+ *   - Streaming enumeration. `claimablePages()` (an async generator) walks
+ *     each page type with keyset pagination (`updated_at ASC, slug`, so a
+ *     page a collector touches mid-run moves later in the walk instead of
+ *     being skipped), drops out-of-scope pages, runs ONE durable-outcome
+ *     lookup per accumulated candidate set, and feeds `runSlidingPool`
+ *     lazily. Memory is bounded by `workers` in-flight pages + one
+ *     candidate set (<= 2 x workers pages), never by the corpus.
+ *     Per-page body cap drops oversize before parsing.
+ *
+ *     Email thread pages (type `email`, collector format) take this path:
+ *
+ *       listPages(keyset) ──► isSingleInboundEmail? ──skip──► (counted, no audit row)
+ *            │ candidates                     │ keep
+ *            ▼                                ▼
+ *       findFreshExtractionOutcomes ──done──► skip (durable)
+ *            │ claimable
+ *            ▼
+ *       runSlidingPool ──► processPageWithLock ──► parseConversation(forcePatternId)
+ *                                                    │ messages (+direction)
+ *                                                    ▼
+ *                                          normalizeEmailMessages
+ *                                            name/address split · automated senders dropped ·
+ *                                            [Open in Gmail] stripped
+ *                                                    ▼
+ *                                          splitIntoSegments(gap 7d, maxChars, minMessages)
+ *                                            oversize messages chunked · both sides of a
+ *                                            char cut kept · episodes dated at their start
+ *                                                    ▼
+ *                                          extractFactsFromTurnWithOutcome(--model)
+ *                                                    ▼
+ *                                          resolveExtractedEntitiesForSave ──► canonicalize
+ *                                                    ▼                          (raw slug -> existing
+ *                                          insertFacts + terminal row           people/ or companies/ sibling)
  *   - Body read prefers frontmatter.raw_transcript when present, then
  *     falls back to compiled_truth + timeline. Meeting pages often
  *     store the real turn-by-turn transcript in a sidecar file while
@@ -75,6 +104,7 @@ import {
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
+import { canonicalLookup } from '../core/model-pricing.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
   loadOpCheckpoint,
@@ -387,6 +417,8 @@ export interface ExtractConversationFactsResult {
   pages_skipped_single_inbound_email: number;
   /** Email messages dropped by EMAIL_AUTOMATED_SENDERS before segmenting. */
   email_messages_dropped_automated: number;
+  /** Raw entity slugs folded onto an existing people/ or companies/ sibling at save time. */
+  entity_slugs_canonicalized: number;
   /** #4136 — pages declined because the winning heading pattern folded a
    *  speaker-shaped unrecognized heading and the parse had fewer than two
    *  distinct speakers (attribution would be wrong). Non-terminal: no
@@ -536,9 +568,14 @@ export function splitIntoSegments(
     cur = [];
   };
 
-  for (const m of filtered) {
-    const ts = Date.parse(m.timestamp);
+  for (const original of filtered) {
+    const ts = Date.parse(original.timestamp);
     if (!Number.isFinite(ts)) continue;
+    const parts =
+      maxChars !== undefined && renderedMessageChars(original) > maxChars
+        ? splitOversizedMessage(original, maxChars)
+        : [original];
+    for (const m of parts) {
     if (lastTs !== null && ts - lastTs > gapMs) flush();
     const chars = renderedMessageChars(m);
     if (maxChars !== undefined && cur.length > 0 && curChars + chars > maxChars) {
@@ -552,6 +589,7 @@ export function splitIntoSegments(
     if (cur.length >= maxMessages) {
       flush();
       lastTs = null;
+    }
     }
   }
   flush();
@@ -571,9 +609,7 @@ export function renderSegmentForExtraction(
     `Conversation between ${segment.participants.join(' and ')} from ${segment.startIso} to ${segment.endIso}`,
     '---',
   ].join('\n');
-  const body = segment.messages
-    .map((m) => `${m.speaker} (${m.timestamp}): ${m.text}`)
-    .join('\n');
+  const body = segment.messages.map(renderMessageLine).join('\n');
   const full = `${header}\n${body}`;
   if (full.length <= SEGMENT_TEXT_CHAR_LIMIT) return full;
   // Truncate from the end of the body, keeping the header intact so the
@@ -582,9 +618,40 @@ export function renderSegmentForExtraction(
   return `${header}\n${body.slice(0, Math.max(0, slack))}\n…(truncated)`;
 }
 
+/** One message as it appears in the extractor's segment body. Single source of truth for the char budget. */
+export function renderMessageLine(m: ConversationMessage): string {
+  return `${m.speaker} (${m.timestamp}): ${m.text}`;
+}
+
 /** Chars one message occupies in renderSegmentForExtraction's body (line + newline). */
 function renderedMessageChars(m: ConversationMessage): number {
-  return m.speaker.length + m.timestamp.length + m.text.length + 6;
+  return renderMessageLine(m).length + 1;
+}
+
+/**
+ * Split one message whose rendered line exceeds the char budget into
+ * consecutive pseudo-messages with the same speaker and timestamp, cutting
+ * at paragraph, then line, then space boundaries. Nothing is truncated:
+ * a 12 KB pasted email becomes three same-speaker turns.
+ */
+export function splitOversizedMessage<M extends ConversationMessage>(m: M, maxChars: number): M[] {
+  const overhead = renderMessageLine({ ...m, text: '' }).length + 1;
+  const budget = Math.max(200, maxChars - overhead);
+  if (m.text.length <= budget) return [m];
+  const parts: M[] = [];
+  let rest = m.text;
+  while (rest.length > budget) {
+    let cut = -1;
+    for (const sep of ['\n\n', '\n', ' ']) {
+      const at = rest.lastIndexOf(sep, budget);
+      if (at >= Math.floor(budget / 2)) { cut = at; break; }
+    }
+    if (cut < 0) cut = budget;
+    parts.push({ ...m, text: rest.slice(0, cut).trim() });
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) parts.push({ ...m, text: rest });
+  return parts;
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +679,8 @@ export interface EmailSender {
 
 /** Split the collector's HTML-escaped `Name <addr>` into display name + address. */
 export function parseEmailSender(raw: string): EmailSender {
-  const decoded = decodeEntities(raw).trim();
+  // The collector's escapeMd emits `&lt;`/`&gt;` and backslash-escaped `[`/`]`.
+  const decoded = decodeEntities(raw).replace(/\\([\[\]])/g, '$1').trim();
   const m = /^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.exec(decoded);
   if (m) {
     const name = m[1].trim().replace(/^"(.*)"$/, '$1').trim();
@@ -688,6 +756,84 @@ export function isSingleInboundEmail(
   const count = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? ''), 10);
   if (!Number.isFinite(count) || count >= 2) return false;
   return !EMAIL_SENT_HEADING_RE.test(page.compiled_truth ?? '');
+}
+
+// ---------------------------------------------------------------------------
+// Save-time entity-slug canonicalization.
+// ---------------------------------------------------------------------------
+
+/** Basename form the resolver's fallback_slugify produces (`Edmund Farrar` -> `edmund-farrar`). */
+export function slugBasename(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/['']/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * The shipped resolver cascade mints BOTH `people/edmund-farrar` and
+ * `edmund-farrar` for the same person, sometimes on the same page across two
+ * runs, so `find_trajectory` (keyed on the exact slug) splits one timeline.
+ * This folds a raw slug onto an existing prefixed sibling (`people/` or
+ * `companies/`, from person/company pages and from facts already written)
+ * when exactly one sibling exists. Raw slugs with no sibling stay raw;
+ * ambiguous ones (both prefixes) stay raw. Prefixed slugs register their
+ * basename so later raw forms in the same run fold onto them.
+ */
+export class EntitySlugCanonicalizer {
+  private readonly byBase = new Map<string, string>();
+  private readonly ambiguous = new Set<string>();
+
+  static async load(engine: BrainEngine, sourceId: string): Promise<EntitySlugCanonicalizer> {
+    const c = new EntitySlugCanonicalizer();
+    try {
+      const pages = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages
+          WHERE deleted_at IS NULL
+            AND (slug LIKE 'people/%' OR slug LIKE 'companies/%')`,
+      );
+      for (const r of pages) c.register(r.slug);
+      const facts = await engine.executeRaw<{ entity_slug: string }>(
+        `SELECT DISTINCT entity_slug FROM facts
+          WHERE source_id = $1
+            AND (entity_slug LIKE 'people/%' OR entity_slug LIKE 'companies/%')`,
+        [sourceId],
+      );
+      for (const r of facts) c.register(r.entity_slug);
+    } catch (err) {
+      process.stderr.write(
+        `[extract-conversation-facts] slug canonicalizer load failed (${err instanceof Error ? err.message : String(err)}); raw slugs stay raw this run\n`,
+      );
+    }
+    return c;
+  }
+
+  /** Remember a prefixed slug. Two prefixes for one basename mark it ambiguous. */
+  register(prefixed: string): void {
+    const i = prefixed.indexOf('/');
+    if (i <= 0) return;
+    const base = prefixed.slice(i + 1);
+    const known = this.byBase.get(base);
+    if (known === undefined) this.byBase.set(base, prefixed);
+    else if (known !== prefixed) this.ambiguous.add(base);
+  }
+
+  /** Canonical slug for an extractor/resolver output; null/undefined pass through. */
+  canonicalize(slug: string | null | undefined): string | null | undefined {
+    if (!slug) return slug;
+    if (slug.includes('/')) {
+      this.register(slug);
+      return slug;
+    }
+    const base = slugBasename(slug);
+    if (!base || this.ambiguous.has(base)) return slug;
+    return this.byBase.get(base) ?? slug;
+  }
+
+  get size(): number {
+    return this.byBase.size;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1068,8 @@ interface ExtractCoreState {
   llmFallbackModel: string | null;
   /** Extractor chat model override (opts.model). */
   model: string | null;
+  /** Save-time raw-slug folding onto existing prefixed siblings. */
+  canonicalizer: EntitySlugCanonicalizer;
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -1124,6 +1272,11 @@ async function processPage(
   let messages = parseResult.messages;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
+  }
+  if (parseResult.date_fallback_count) {
+    process.stderr.write(
+      `[extract-conversation-facts] ${page.slug}: ${parseResult.date_fallback_count} anchor line(s) had an unparseable date; anchored on the page date instead of folding into the previous speaker\n`,
+    );
   }
   // #4136 — the winning heading pattern folded heading-shaped lines into the
   // previous turn's body instead of anchoring them. Decline ONLY when a
@@ -1344,8 +1497,12 @@ async function processPage(
       // (above) ran every fact through the shipped resolver cascade (#3729/#4052),
       // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
       // the same issue) is superseded rather than layered on top.
-      const rows = extracted.map((fact, i) => ({
+      const rows = extracted.map((fact, i) => {
+        const canonical = state.canonicalizer.canonicalize(fact.entity_slug);
+        if (canonical !== fact.entity_slug) state.result.entity_slugs_canonicalized++;
+        return {
         ...fact,
+        entity_slug: canonical,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
         source: PER_SEGMENT_SOURCE_PREFIX,
@@ -1358,7 +1515,8 @@ async function processPage(
           : {}),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
-      }));
+        };
+      });
       const ins = await state.engine.insertFacts(rows, { source_id: state.sourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
@@ -1500,6 +1658,7 @@ export async function runExtractConversationFactsCore(
     pages_marked_non_extractable: 0,
     pages_skipped_single_inbound_email: 0,
     email_messages_dropped_automated: 0,
+    entity_slugs_canonicalized: 0,
     pages_skipped_unrecognized_speaker: 0,
     pages_failed: 0,
     pages_llm_fallback: 0,
@@ -1562,6 +1721,7 @@ export async function runExtractConversationFactsCore(
       })
     : null;
 
+  const canonicalizer = await EntitySlugCanonicalizer.load(engine, sourceId);
   const state: ExtractCoreState = {
     result,
     engine,
@@ -1575,6 +1735,7 @@ export async function runExtractConversationFactsCore(
     cpMap: new Map(),
     llmFallbackModel,
     model: opts.model ?? null,
+    canonicalizer,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
@@ -1683,116 +1844,95 @@ export async function runExtractConversationFactsCore(
 
       await processPageWithLock(page);
     } else {
-      // Multi-page enumeration: paginate per-type at small batch size to
-      // bound memory (Eng-v2 C8 — 10 × 25MB = 250MB worst case).
-      // v0.41.15.0 (D9): inner per-page loop replaced with runSlidingPool
-      // so parallel workers can claim pages from the batch. The pool
-      // honors AbortSignal at each claim boundary and threads
-      // BudgetExhausted abort (D13) automatically.
-      let processedPagesCount = 0;
-      pageLoop: for (const type of concreteTypes) {
-        let offset = 0;
-        // Claim buffer: a batch is an enumeration unit, not a work unit. After
-        // the scope + durable filters a 10-page batch may hold two claimable
-        // pages, and running the pool per batch caps effective parallelism at
-        // that (measured: ~5 in-flight pages at --workers 16 on the email
-        // corpus). Fill the pool before running it.
-        let pending: Page[] = [];
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          if (signal?.aborted) throw new Error('aborted');
-          if (opts.limit && processedPagesCount >= opts.limit) break pageLoop;
-
-          const batch = await engine.listPages({
-            type,
-            sourceId,
-            limit: PAGE_LIST_BATCH,
-            offset,
+      // Streaming enumeration (see the module doc): an async generator walks
+      // each type with keyset pagination, filters, and feeds the pool lazily.
+      // No per-batch barrier: a worker that finishes a short page pulls the
+      // next candidate while its siblings are still on long threads.
+      const candidateBatch = Math.max(PAGE_LIST_BATCH, workers * 2);
+      let yielded = 0;
+      const claimablePages = async function* (): AsyncGenerator<Page> {
+        // Filter one accumulated candidate set: one durable-outcome query per
+        // set instead of one per 10-page list read (Perf 8A).
+        const filterCandidates = async (candidates: Page[]): Promise<Page[]> => {
+          if (opts.force || candidates.length === 0) return candidates;
+          const fresh = await findFreshExtractionOutcomes(engine, sourceId, candidates);
+          return candidates.filter((page) => {
+            const outcome = fresh.get(page.slug);
+            if (!outcome) return true;
+            recordDurableOutcomeSkip(state, outcome);
+            return false;
           });
-          if (batch.length === 0 && pending.length === 0) break;
-          // Email: single inbound messages are out of scope. Skip them before
-          // the durable lookup, so they cost one list read and no audit row.
-          const inboundSingles = batch.filter(isSingleInboundEmail);
-          if (inboundSingles.length > 0) {
-            state.result.pages_skipped_single_inbound_email += inboundSingles.length;
-          }
-          let claimable =
-            inboundSingles.length > 0 ? batch.filter((p) => !isSingleInboundEmail(p)) : batch;
-          // Checkpoints are an intra-page cursor; fresh durable outcomes are
-          // the page-level selection authority and survive checkpoint GC.
-          if (!opts.force && claimable.length > 0) {
-            const fresh = await findFreshExtractionOutcomes(
-              engine,
+        };
+        for (const type of concreteTypes) {
+          let keyset: { updatedAt: string; slug: string } | undefined;
+          let candidates: Page[] = [];
+          let exhausted = false;
+          while (!exhausted) {
+            if (signal?.aborted) throw new Error('aborted');
+            if (opts.limit && yielded >= opts.limit) return;
+            const batch = await engine.listPages({
+              type,
               sourceId,
-              claimable,
-            );
-            claimable = claimable.filter((page) => {
-              const outcome = fresh.get(page.slug);
-              if (!outcome) return true;
-              recordDurableOutcomeSkip(state, outcome);
-              return false;
+              limit: PAGE_LIST_BATCH,
+              sort: 'updated_asc',
+              ...(keyset ? { updatedAfterKeyset: keyset } : {}),
             });
-          }
-
-          pending.push(...claimable);
-          offset += batch.length;
-          const lastBatch = batch.length < PAGE_LIST_BATCH;
-          const limitReached = opts.limit
-            ? processedPagesCount + pending.length >= opts.limit
-            : false;
-          if (pending.length < workers * 2 && !lastBatch && !limitReached) continue;
-
-          // Apply --limit after durable filtering. The limit caps pages that
-          // need work, not already-completed pages scanned to find that work.
-          let work = pending;
-          pending = [];
-          if (opts.limit) {
-            const remaining = opts.limit - processedPagesCount;
-            if (remaining < work.length) {
-              work = work.slice(0, remaining);
+            if (batch.length > 0) {
+              const last = batch[batch.length - 1];
+              keyset = { updatedAt: new Date(last.updated_at).toISOString(), slug: last.slug };
+            }
+            exhausted = batch.length < PAGE_LIST_BATCH;
+            // Email: single inbound messages are out of scope. Skip them before
+            // the durable lookup, so they cost one list read and no audit row.
+            for (const page of batch) {
+              if (isSingleInboundEmail(page)) state.result.pages_skipped_single_inbound_email++;
+              else candidates.push(page);
+            }
+            if (candidates.length < candidateBatch && !exhausted) continue;
+            const claimable = await filterCandidates(candidates);
+            candidates = [];
+            for (const page of claimable) {
+              if (opts.limit && yielded >= opts.limit) return;
+              yielded++;
+              yield page;
+            }
+            // Persist the intra-page checkpoint cursor between candidate sets
+            // so a crash mid-walk loses at most one set's worth of resume
+            // state (terminal rows, not this cursor, decide completion).
+            if (!dryRun) {
+              await recordCompleted(engine, checkpointKey(sourceId), cpMapToEntries(state.cpMap));
             }
           }
-
-          const poolResult = await runSlidingPool({
-            items: work,
-            workers,
-            signal,
-            onItem: (page) => processPageWithLock(page),
-            onError: (error) => (isAbortError(error) ? 'abort' : 'continue'),
-            failureLabel: (page) => page.slug,
-          });
-          const cancellation = poolResult.failures.find((failure) =>
-            isAbortError(failure.error),
-          );
-          if (cancellation) throw cancellation.error;
-          if (signal?.aborted) {
-            if (signal.reason instanceof Error) throw signal.reason;
-            throw Object.assign(new Error('caller cancelled'), {
-              name: 'AbortError',
-            });
-          }
-          result.pages_failed += poolResult.errored;
-          for (const failure of poolResult.failures) {
-            const message = failure.error instanceof Error
-              ? failure.error.message
-              : String(failure.error);
-            process.stderr.write(
-              `[extract-conversation-facts] ${failure.label} failed: ${message}\n`,
-            );
-          }
-
-          processedPagesCount += work.length;
-          if (lastBatch) break;
-
-          // Persist checkpoint between batches so a crash mid-walk
-          // doesn't lose all progress.
-          if (!dryRun) {
-            await recordCompleted(engine, checkpointKey(sourceId), cpMapToEntries(state.cpMap));
-          }
         }
+      };
+      const poolResult = await runSlidingPool({
+        items: claimablePages(),
+        workers,
+        signal,
+        onItem: (page) => processPageWithLock(page),
+        onError: (error) => (isAbortError(error) ? 'abort' : 'continue'),
+        failureLabel: (page) => page.slug,
+      });
+      const cancellation = poolResult.failures.find((failure) =>
+        isAbortError(failure.error),
+      );
+      if (cancellation) throw cancellation.error;
+      if (signal?.aborted) {
+        if (signal.reason instanceof Error) throw signal.reason;
+        throw Object.assign(new Error('caller cancelled'), {
+          name: 'AbortError',
+        });
+      }
+      result.pages_failed += poolResult.errored;
+      for (const failure of poolResult.failures) {
+        const message = failure.error instanceof Error
+          ? failure.error.message
+          : String(failure.error);
+        process.stderr.write(
+          `[extract-conversation-facts] ${failure.label} failed: ${message}\n`,
+        );
       }
     }
-
     // Final checkpoint flush.
     if (!dryRun) {
       await recordCompleted(engine, checkpointKey(sourceId), cpMapToEntries(state.cpMap));
@@ -2163,7 +2303,25 @@ export async function runExtractConversationFacts(
     );
     process.exit(1);
   }
-
+  // --model must be servable before any page is claimed: an unknown id would
+  // otherwise fail every segment with chat_unavailable after a lock + snapshot.
+  if (parsed.model && !parsed.dryRun && !isAvailable('chat', parsed.model)) {
+    console.error(
+      `--model ${parsed.model} is not servable by the chat gateway (unknown provider, or its key is missing). ` +
+      'Use the provider:model form, e.g. openai:gpt-5.6-sol.',
+    );
+    process.exit(1);
+  }
+  // isAvailable only proves the provider key; the model id itself is checked
+  // against the pricing table, because a run always carries a cost cap and
+  // BudgetTracker hard-fails reserve() with no_pricing for an unpriced id.
+  if (parsed.model && !parsed.dryRun && !canonicalLookup(parsed.model)) {
+    console.error(
+      `--model ${parsed.model} has no pricing entry (src/core/model-pricing.ts), so the --max-cost-usd cap cannot gate it ` +
+      'and every segment would fail with no_pricing. Use a priced id (e.g. openai:gpt-5.6-sol) or add the entry first.',
+    );
+    process.exit(1);
+  }
   // Aggregate result across all sources.
   const aggregate: ExtractConversationFactsResult = {
     pages_considered: 0,
@@ -2176,6 +2334,7 @@ export async function runExtractConversationFacts(
     pages_marked_non_extractable: 0,
     pages_skipped_single_inbound_email: 0,
     email_messages_dropped_automated: 0,
+    entity_slugs_canonicalized: 0,
     pages_skipped_unrecognized_speaker: 0,
     pages_failed: 0,
     pages_llm_fallback: 0,
@@ -2206,7 +2365,7 @@ export async function runExtractConversationFacts(
         types: parsed.types,
         slug: parsed.slug,
         dryRun: parsed.dryRun,
-    model: parsed.model,
+        model: parsed.model,
         limit: parsed.limit,
         sinceIso: parsed.sinceIso,
         force: parsed.force,
@@ -2227,6 +2386,7 @@ export async function runExtractConversationFacts(
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
       aggregate.pages_skipped_single_inbound_email += perSource.pages_skipped_single_inbound_email;
       aggregate.email_messages_dropped_automated += perSource.email_messages_dropped_automated;
+      aggregate.entity_slugs_canonicalized += perSource.entity_slugs_canonicalized;
       aggregate.pages_skipped_unrecognized_speaker += perSource.pages_skipped_unrecognized_speaker;
       aggregate.pages_failed += perSource.pages_failed;
       aggregate.pages_llm_fallback += perSource.pages_llm_fallback;
@@ -2280,6 +2440,9 @@ export async function runExtractConversationFacts(
   }
   if (aggregate.email_messages_dropped_automated > 0) {
     console.log(`  Dropped ${aggregate.email_messages_dropped_automated} email message(s) from automated senders before segmenting.`);
+  }
+  if (aggregate.entity_slugs_canonicalized > 0) {
+    console.log(`  Canonicalized ${aggregate.entity_slugs_canonicalized} raw entity slug(s) onto existing people/ or companies/ siblings.`);
   }
   if (aggregate.pages_failed > 0) {
     console.error(`  Failed ${aggregate.pages_failed} page(s); they remain unfinished and will retry.`);

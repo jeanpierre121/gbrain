@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
@@ -38,6 +38,10 @@ import {
   EMAIL_SEGMENT_GAP_MINUTES,
   normalizeEmailMessages,
   parseEmailSender,
+  renderMessageLine,
+  splitOversizedMessage,
+  slugBasename,
+  EntitySlugCanonicalizer,
   isAutomatedEmailSender,
   isSingleInboundEmail,
   SEGMENT_TEXT_CHAR_LIMIT,
@@ -1843,5 +1847,332 @@ describe('splitIntoSegments — email options', () => {
     const one = [msg(0, '2026-06-18T07:46:32.000Z')];
     expect(splitIntoSegments(one)).toHaveLength(0);
     expect(splitIntoSegments(one, { minMessages: 1 })).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-28 eng review: render DRY, oversize chunking, unescape, canonicalizer.
+// ---------------------------------------------------------------------------
+
+describe('renderMessageLine is the single source of the segment body format', () => {
+  test('renderSegmentForExtraction body lines are renderMessageLine(m)', () => {
+    const msgs = [
+      { speaker: 'Alice', timestamp: '2026-06-18T07:46:32.000Z', text: 'hello' },
+      { speaker: 'Bob', timestamp: '2026-06-18T07:47:00.000Z', text: 'hi\nsecond line' },
+    ];
+    const seg = { messages: msgs, startIso: msgs[0].timestamp, endIso: msgs[1].timestamp, participants: ['Alice', 'Bob'] };
+    const rendered = renderSegmentForExtraction('Page title', seg);
+    for (const m of msgs) expect(rendered).toContain(renderMessageLine(m));
+  });
+});
+
+describe('splitOversizedMessage', () => {
+  const base = { speaker: 'Alice Example', timestamp: '2026-06-18T07:46:32.000Z' };
+  test('a short message is returned as-is', () => {
+    const m = { ...base, text: 'short' };
+    expect(splitOversizedMessage(m, DEFAULT_SEGMENT_MAX_CHARS)).toEqual([m]);
+  });
+  test('a 12 KB message becomes several same-speaker parts, nothing lost, each under budget', () => {
+    const para = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(20).trim();
+    const text = Array.from({ length: 12 }, (_, i) => `Paragraph ${i}: ${para}`).join('\n\n');
+    expect(text.length).toBeGreaterThan(12_000);
+    const parts = splitOversizedMessage({ ...base, text, direction: 'sent' as const }, DEFAULT_SEGMENT_MAX_CHARS);
+    expect(parts.length).toBeGreaterThanOrEqual(3);
+    for (const p of parts) {
+      expect(p.speaker).toBe(base.speaker);
+      expect(p.timestamp).toBe(base.timestamp);
+      expect(p.direction).toBe('sent');
+      expect(renderMessageLine(p).length + 1).toBeLessThanOrEqual(DEFAULT_SEGMENT_MAX_CHARS);
+    }
+    const joined = parts.map((p) => p.text).join(' ').replace(/\s+/g, ' ');
+    expect(joined).toBe(text.replace(/\s+/g, ' '));
+  });
+  test('splitIntoSegments chunks an oversize message instead of leaving it to truncation', () => {
+    const text = 'x'.repeat(4000) + '\n\n' + 'y'.repeat(4000) + '\n\n' + 'z'.repeat(4000);
+    const msgs = [
+      { speaker: 'Alice', timestamp: '2026-06-18T07:46:32.000Z', text },
+      { speaker: 'Bob', timestamp: '2026-06-18T08:00:00.000Z', text: 'ack' },
+    ];
+    const segs = splitIntoSegments(msgs, { gapMinutes: EMAIL_SEGMENT_GAP_MINUTES, maxChars: DEFAULT_SEGMENT_MAX_CHARS, minMessages: 1 });
+    const total = segs.reduce((n, s) => n + s.messages.length, 0);
+    expect(total).toBeGreaterThanOrEqual(4);
+    for (const s of segs) expect(renderSegmentForExtraction('t', s).endsWith('…(truncated)')).toBe(false);
+    expect(segs.flatMap((s) => s.messages).map((m) => m.text).join('').replace(/\s/g, '')).toBe(text.replace(/\s/g, '') + 'ack');
+  });
+});
+
+describe('parseEmailSender undoes the collector escapes', () => {
+  test('backslash-escaped brackets and HTML entities', () => {
+    expect(parseEmailSender('\\[EXT\\] Dana Reyes &lt;dana@example.com&gt;')).toEqual({
+      name: '[EXT] Dana Reyes',
+      address: 'dana@example.com',
+    });
+  });
+});
+
+describe('EntitySlugCanonicalizer', () => {
+  test('folds raw and display-name forms onto the one known prefixed sibling', () => {
+    const c = new EntitySlugCanonicalizer();
+    c.register('people/edmund-farrar');
+    c.register('companies/oto');
+    expect(c.canonicalize('edmund-farrar')).toBe('people/edmund-farrar');
+    expect(c.canonicalize('Edmund Farrar')).toBe('people/edmund-farrar');
+    expect(c.canonicalize('oto')).toBe('companies/oto');
+    expect(c.canonicalize('someone-unknown')).toBe('someone-unknown');
+    expect(c.canonicalize(null)).toBeNull();
+    expect(c.canonicalize(undefined)).toBeUndefined();
+  });
+  test('a prefixed slug seen at save time registers its basename for later raw forms', () => {
+    const c = new EntitySlugCanonicalizer();
+    expect(c.canonicalize('companies/ten-dev')).toBe('companies/ten-dev');
+    expect(c.canonicalize('ten-dev')).toBe('companies/ten-dev');
+    expect(c.canonicalize('Ten Dev')).toBe('companies/ten-dev');
+  });
+  test('an ambiguous basename (both prefixes) stays raw', () => {
+    const c = new EntitySlugCanonicalizer();
+    c.register('people/mercury');
+    c.register('companies/mercury');
+    expect(c.canonicalize('mercury')).toBe('mercury');
+  });
+  test('slugBasename matches the resolver fallback form', () => {
+    expect(slugBasename("Juan's Company, Ltd.")).toBe('juans-company-ltd');
+    expect(slugBasename('  Edmund   Farrar ')).toBe('edmund-farrar');
+  });
+});
+
+describe('CLI + job wiring pins (2026-08-28 review)', () => {
+  const cmdSrc = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'extract-conversation-facts.ts'), 'utf8');
+  const jobsSrc = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'jobs.ts'), 'utf8');
+  test('--model is parsed, validated up front, and handed to the core', () => {
+    expect(cmdSrc).toContain("if (a === '--model') { out.model = args[++i]; continue; }");
+    expect(cmdSrc).toContain("!isAvailable('chat', parsed.model)");
+    expect(cmdSrc).toContain('!canonicalLookup(parsed.model)');
+    expect(cmdSrc).toMatch(/dryRun: parsed\.dryRun,\n\s+model: parsed\.model,/);
+  });
+  test('the background job handler forwards job.data.model (round trip with buildJobParams)', () => {
+    const start = jobsSrc.indexOf("registerBuiltinJob(worker, engine, 'extract-conversation-facts'");
+    expect(start).toBeGreaterThan(0);
+    const end = jobsSrc.indexOf('return result;', start);
+    const handler = jobsSrc.slice(start, end);
+    expect(handler).toContain("model: typeof job.data.model === 'string' ? job.data.model : undefined");
+    expect(handler).toContain("workers: typeof job.data.workers === 'number' ? job.data.workers : undefined");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Email thread pages end to end through the core (PGLite, injected extractor).
+// ---------------------------------------------------------------------------
+
+const EMAIL_HDR = (name: string, addr: string, date: string, dir: 'sent' | 'received') =>
+  `## ${name} &lt;${addr}&gt; — ${date} (${dir})`;
+
+describe('email pages through runExtractConversationFactsCore', () => {
+  let engine: PGLiteEngine;
+  const turns: string[] = [];
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    __setEmbedTransportForTests(
+      (async ({ values }: { values: string[] }) => ({
+        embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)),
+      })) as never,
+    );
+    await engine.putPage('people/edmund-farrar', {
+      type: 'person',
+      title: 'Edmund Farrar',
+      compiled_truth: 'Profile.',
+      frontmatter: {},
+    });
+    // (1) A real thread: owner sent, one automated relay, one human reply.
+    await engine.putPage('email-thread-aaa1', {
+      type: 'email' as never,
+      title: 'Email thread: Oto - Caribou Renewal',
+      compiled_truth: [
+        '# Email thread: Oto - Caribou Renewal',
+        EMAIL_HDR('Juan Andrade', 'juan@example.com', 'Thu, 18 Jun 2026 07:46:32 +0000', 'sent'),
+        '',
+        '[Open in Gmail](https://mail.google.com/mail/u/?authuser=juan%40example.com#inbox/aaa1)',
+        '',
+        'Hey Ed, your renewal is due on 28 August 2026.',
+        '',
+        EMAIL_HDR('"Frank Silva (Google Docs)"', 'comments-noreply@docs.google.com', 'Thu, 18 Jun 2026 09:00:00 +0000', 'received'),
+        '',
+        'Frank commented on the doc.',
+        '',
+        EMAIL_HDR('Edmund Farrar', 'ed@example.com', 'Fri, 19 Jun 2026 08:03:59 +0100', 'received'),
+        '',
+        "I'd like to descope the agreement.",
+      ].join('\n'),
+      frontmatter: { subject: 'Oto - Caribou Renewal', message_count: 3 },
+    });
+    // (2) A single message the owner sent.
+    await engine.putPage('email-thread-bbb2', {
+      type: 'email' as never,
+      title: 'Email thread: Following up',
+      compiled_truth: [
+        '# Email thread: Following up',
+        EMAIL_HDR('Juan Andrade', 'juan@example.com', 'Mon, 22 Jun 2026 10:00:00 +0000', 'sent'),
+        '',
+        'Following up on the proposal I sent last week.',
+      ].join('\n'),
+      frontmatter: { subject: 'Following up', message_count: 1 },
+    });
+    // (3) A single inbound message: out of scope, pre-filtered, never audited.
+    await engine.putPage('email-thread-ccc3', {
+      type: 'email' as never,
+      title: 'Email thread: Weekly digest',
+      compiled_truth: [
+        '# Email thread: Weekly digest',
+        EMAIL_HDR('Newsletter', 'news@example.com', 'Tue, 23 Jun 2026 10:00:00 +0000', 'received'),
+        '',
+        'Read this.',
+      ].join('\n'),
+      frontmatter: { subject: 'Weekly digest', message_count: 1 },
+    });
+    // (4) Two messages, both automated: parses, normalizes to nothing, audited.
+    await engine.putPage('email-thread-ddd4', {
+      type: 'email' as never,
+      title: 'Email thread: Doc comments',
+      compiled_truth: [
+        '# Email thread: Doc comments',
+        EMAIL_HDR('"A (Google Docs)"', 'comments-noreply@docs.google.com', 'Wed, 24 Jun 2026 10:00:00 +0000', 'received'),
+        '',
+        'A commented.',
+        '',
+        EMAIL_HDR('"B (Google Docs)"', 'comments-noreply@docs.google.com', 'Wed, 24 Jun 2026 11:00:00 +0000', 'received'),
+        '',
+        'B commented.',
+      ].join('\n'),
+      frontmatter: { subject: 'Doc comments', message_count: 2 },
+    });
+  });
+
+  afterAll(async () => {
+    __setEmbedTransportForTests(null);
+  });
+
+  test('extracts the thread and the owner-sent single, skips the inbound single, audits the automated pair', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['email'],
+      overrideDisabled: true,
+      extractor: async (input) => {
+        turns.push(input.turnText);
+        return [
+          // A person page exists: the shipped resolver already maps this one.
+          { fact: 'Edmund Farrar wants to descope the agreement.', kind: 'commitment', entity_slug: 'edmund-farrar', confidence: 0.9, notability: 'medium' } as never,
+          // No page for Oto: the resolver slugifies; the prefixed form seen
+          // first in this turn registers, and the raw form folds onto it.
+          { fact: 'Oto renews on 28 August.', kind: 'event', entity_slug: 'companies/oto', confidence: 0.9, notability: 'medium' } as never,
+          { fact: 'Oto wants a smaller scope.', kind: 'commitment', entity_slug: 'oto', confidence: 0.9, notability: 'medium' } as never,
+        ];
+      },
+    });
+    expect(result.pages_processed).toBe(2);
+    expect(result.pages_skipped_single_inbound_email).toBe(1);
+    expect(result.pages_marked_non_extractable).toBe(1);
+    expect(result.email_messages_dropped_automated).toBe(3);
+    expect(result.facts_inserted).toBe(6);
+    expect(result.entity_slugs_canonicalized).toBe(2);
+    // The thread's segment text: display names, no relay, no Gmail link.
+    const thread = turns.find((t) => t.includes('Oto - Caribou Renewal'));
+    expect(thread).toBeDefined();
+    expect(thread).toContain('Juan Andrade (2026-06-18T07:46:32.000Z): Hey Ed');
+    expect(thread).toContain('Edmund Farrar (2026-06-19T07:03:59.000Z):');
+    expect(thread).not.toContain('Open in Gmail');
+    expect(thread).not.toContain('Google Docs');
+    expect(thread).not.toContain('&lt;');
+    const rows = await engine.executeRaw<{ source_markdown_slug: string; entity_slug: string; valid_from: string; source: string }>(
+      `SELECT source_markdown_slug, entity_slug, valid_from::text AS valid_from, source
+         FROM facts WHERE source_id = 'default' ORDER BY source_markdown_slug, source`,
+    );
+    const real = rows.filter((r) => r.source === 'cli:extract-conversation-facts');
+    expect([...new Set(real.map((r) => r.source_markdown_slug))].sort()).toEqual(['email-thread-aaa1', 'email-thread-bbb2']);
+    expect(new Set(real.map((r) => r.entity_slug))).toEqual(new Set(['people/edmund-farrar', 'companies/oto']));
+    expect(real.find((r) => r.source_markdown_slug === 'email-thread-aaa1')?.valid_from.startsWith('2026-06-18')).toBe(true);
+    const terminal = rows.filter((r) => r.source === 'cli:extract-conversation-facts:terminal:v2').map((r) => r.source_markdown_slug).sort();
+    expect(terminal).toEqual(['email-thread-aaa1', 'email-thread-bbb2']);
+    const audited = rows.filter((r) => r.source === 'cli:extract-conversation-facts:non-extractable:v2').map((r) => r.source_markdown_slug);
+    expect(audited).toEqual(['email-thread-ddd4']);
+    // Never audited: the inbound single is skipped before any durable write.
+    expect(rows.some((r) => r.source_markdown_slug === 'email-thread-ccc3')).toBe(false);
+  });
+
+  test('a second run skips both completed pages via durable outcomes and re-skips the inbound single', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['email'],
+      overrideDisabled: true,
+      extractor: async () => [],
+    });
+    expect(result.pages_processed).toBe(0);
+    expect(result.pages_skipped_completed).toBe(2);
+    expect(result.pages_skipped_non_extractable).toBe(1);
+    expect(result.pages_skipped_single_inbound_email).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REGRESSION: enumeration across batches (generator + keyset walk).
+// ---------------------------------------------------------------------------
+
+describe('enumeration walks every batch and honors --limit across batches', () => {
+  let engine: PGLiteEngine;
+  const PAGES = 25; // > 2 x PAGE_LIST_BATCH so the walk crosses batch boundaries
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    __setEmbedTransportForTests(
+      (async ({ values }: { values: string[] }) => ({
+        embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)),
+      })) as never,
+    );
+    for (let i = 0; i < PAGES; i++) {
+      await engine.putPage(`conversations/walk-${String(i).padStart(2, '0')}`, {
+        type: 'conversation',
+        title: `Walk ${i}`,
+        compiled_truth: [
+          fmt('Alice Example', '2024-03-15', '9:00 AM', `Message ${i} one.`),
+          fmt('Bob Demo', '2024-03-15', '9:01 AM', `Message ${i} two.`),
+        ].join('\n'),
+        frontmatter: { date: '2024-03-15' },
+      });
+    }
+  });
+
+  afterAll(async () => {
+    __setEmbedTransportForTests(null);
+  });
+
+  const run = (limit?: number) =>
+    runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['conversation'],
+      overrideDisabled: true,
+      ...(limit ? { limit } : {}),
+      extractor: async () => [
+        { fact: 'A fact.', kind: 'fact', entity_slug: 'alice-example', confidence: 0.9, notability: 'low' } as never,
+      ],
+    });
+
+  test('--limit 7 processes exactly 7 pages even though a batch holds 10', async () => {
+    const r = await run(7);
+    expect(r.pages_processed).toBe(7);
+  });
+
+  test('the next unbounded run processes the remaining 18 and skips the 7 durable ones', async () => {
+    const r = await run();
+    expect(r.pages_processed).toBe(PAGES - 7);
+    expect(r.pages_skipped_completed).toBe(7);
+  });
+
+  test('a third run touches nothing', async () => {
+    const r = await run();
+    expect(r.pages_processed).toBe(0);
+    expect(r.pages_skipped_completed).toBe(PAGES);
   });
 });
