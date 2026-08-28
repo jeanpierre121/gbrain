@@ -2304,6 +2304,8 @@ export async function registerBuiltinHandlers(
       // `gbrain extract-conversation-facts --background --workers 20`
       // works end-to-end.
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
+      // Round-trip --model the same way; buildJobParams sends it.
+      model: typeof job.data.model === 'string' ? job.data.model : undefined,
     });
     return result;
   });
