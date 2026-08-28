@@ -6184,7 +6184,9 @@ keeping both skills' triggers intact for chaining.
 
 ## Facts / email threads (filed on fork run/full-facts, 2026-08-28 eng review)
 
-### Entity-slug canonicalization pass after email pass 1
+### Entity-slug canonicalization pass after email pass 1 — DONE 2026-08-28
+
+**Done:** 44,067 rows across 1,379 raw slugs folded onto 1,184 prefixed siblings (unambiguous only). Mapping kept in table `facts_slug_canonicalization_20260828 (fact_id, old_slug, new_slug)`; reverse with `UPDATE facts f SET entity_slug = m.old_slug FROM facts_slug_canonicalization_20260828 m WHERE f.id = m.fact_id AND f.entity_slug = m.new_slug`. Left raw by design: 1,049 ambiguous rows (both prefixes exist) + 13,568 with no sibling.
 
 **What:** One SQL pass that rewrites raw-name `facts.entity_slug` values to their canonical sibling when one exists (`ten-dev` -> `companies/ten-dev`, `isembard` -> `companies/isembard`, `Juan Andrade`/`Juan` -> `people/juan-andrade`), driven by a mapping table and a dry-run report first.
 
