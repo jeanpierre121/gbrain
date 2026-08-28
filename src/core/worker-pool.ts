@@ -104,8 +104,16 @@ export interface PoolFailure {
 }
 
 export interface SlidingPoolOpts<T> {
-  /** Pre-enumerated work list. Empty input is a no-op (returns immediately). */
-  items: readonly T[];
+  /**
+   * Work items. An array is claimed by index (the atomic `nextIdx++` claim
+   * below); empty input is a no-op. An `AsyncIterable` (typically an async
+   * generator) is pulled lazily: workers take the next item as soon as they
+   * free up, so a slow producer never becomes a barrier and memory stays at
+   * `workers` items plus whatever the producer buffers. Pulls are serialized
+   * through one promise chain, so any AsyncIterable is safe, not only
+   * generators. `onProgress` receives `total = -1` for streams.
+   */
+  items: readonly T[] | AsyncIterable<T>;
   /** Worker count. Clamped to `[1, items.length]` internally. */
   workers: number;
   /**
@@ -173,17 +181,17 @@ export interface SlidingPoolResult {
  * than work.
  */
 export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<SlidingPoolResult> {
-  const items = opts.items;
-  const total = items.length;
+  const stream = isAsyncIterable(opts.items) ? opts.items : null;
+  const items: readonly T[] = stream ? [] : (opts.items as readonly T[]);
+  const total = stream ? -1 : items.length;
   const result: SlidingPoolResult = {
     processed: 0,
     errored: 0,
     aborted: false,
     failures: [],
   };
-  if (total === 0) return result;
-
-  const workerCount = Math.max(1, Math.min(opts.workers, total));
+  if (!stream && total === 0) return result;
+  const workerCount = stream ? Math.max(1, opts.workers) : Math.max(1, Math.min(opts.workers, total));
   const labelFn = opts.failureLabel ?? ((x: T) => String(x));
   // Local AbortController composed with the caller's signal so a
   // must-abort error from one worker also signals every other worker's
@@ -207,19 +215,40 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
   // that put an `await` between the `nextIdx` read and write OR import
   // `worker_threads` alongside this module.
   let nextIdx = 0;
-
+  // Stream path: one serialized pull chain so concurrent workers never call
+  // `next()` on a non-generator AsyncIterable out of order.
+  const iterator = stream ? stream[Symbol.asyncIterator]() : null;
+  let pullChain: Promise<IteratorResult<T>> = Promise.resolve({ done: true, value: undefined as never });
+  let streamIdx = 0;
+  const pullStream = (): Promise<IteratorResult<T>> => {
+    const pull = () => (iterator as AsyncIterator<T>).next();
+    pullChain = pullChain.then(pull, pull);
+    return pullChain;
+  };
   async function worker(workerIdx: number): Promise<void> {
     while (true) {
       if (localAbort.signal.aborted) {
         result.aborted = true;
         return;
       }
-      if (nextIdx >= total) return;
-      // ATOMICITY INVARIANT: this line is the load-bearing claim.
-      // Read + increment must remain a single synchronous statement.
-      // Do NOT insert `await` between them. See module header.
-      const idx = nextIdx++;
-      const item = items[idx];
+      let idx: number;
+      let item: T;
+      if (stream) {
+        const pulled = await pullStream();
+        if (localAbort.signal.aborted) {
+          result.aborted = true;
+          return;
+        }
+        if (pulled.done) return;
+        idx = streamIdx++;
+        item = pulled.value;
+      } else {
+        // Array path: the claim below MUST stay one synchronous statement
+        // (see the ATOMICITY INVARIANT in the header).
+        if (nextIdx >= total) return;
+        idx = nextIdx++;
+        item = items[idx];
+      }
       try {
         await opts.onItem(item, idx, workerIdx);
         result.processed++;
@@ -254,9 +283,17 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
     );
   } finally {
     if (opts.signal) opts.signal.removeEventListener('abort', onCallerAbort);
+    // Close a generator that still has items (abort or must-abort exit) so
+    // its finally blocks run and no producer is left suspended.
+    if (iterator && typeof iterator.return === 'function') {
+      try { await iterator.return(undefined); } catch { /* producer cleanup is best-effort */ }
+    }
   }
-
   return result;
+}
+
+function isAsyncIterable<T>(x: readonly T[] | AsyncIterable<T>): x is AsyncIterable<T> {
+  return typeof (x as AsyncIterable<T>)[Symbol.asyncIterator] === 'function';
 }
 
 /**
