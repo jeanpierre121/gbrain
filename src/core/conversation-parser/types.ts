@@ -92,6 +92,13 @@ export interface ParseResult {
    *  decline (the parser stays purely descriptive). Undefined when empty so
    *  healthy-page JSON output is byte-identical. */
   unrecognized_headings?: string[];
+  /**
+   * Anchor lines whose date could not be parsed (rfc2822 zone words the
+   * engine rejects, malformed digits). Each one still opens a message,
+   * anchored on the page's fallback date, so its body is never folded into
+   * the previous speaker. Absent when zero.
+   */
+  date_fallback_count?: number;
 }
 
 /**
@@ -276,7 +283,8 @@ export interface ParseConversationOpts {
    * page format (the email collector's thread pages) use it so a page with
    * a single anchored heading is not rejected by the density scorer. Falls
    * through to normal scoring when the id is unknown or the forced pattern
-   * yields no messages.
+   * yields no messages. The forced path returns before LLM polish and the
+   * LLM fallback, so neither runs for a forced page.
    */
   forcePatternId?: string;
   /** When true, skip LLM fallback even if config enables it. */

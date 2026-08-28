@@ -180,8 +180,16 @@ function buildIso(
   // (`Thu, 18 Jun 2026 07:46:32 +0100`, `... +0000 (UTC)`). The offset is
   // honored, so the ISO output is true UTC — no timezone assumption.
   if (entry.time_format === 'rfc2822' && captures.date_group !== undefined) {
-    const raw = match[captures.date_group];
-    const ms = typeof raw === 'string' ? Date.parse(raw.trim()) : Number.NaN;
+    const raw = typeof match[captures.date_group] === 'string' ? match[captures.date_group].trim() : '';
+    let ms = raw ? Date.parse(raw) : Number.NaN;
+    if (!Number.isFinite(ms) && raw) {
+      // Zone WORDS (`CET`, `BST`, `IST`) are implementation-defined in
+      // Date.parse; retry with the word replaced by a numeric zero offset so
+      // the wall-clock time survives (off by the zone's offset, never off by
+      // months). Numeric offsets and `GMT`/`UTC` already parsed above.
+      const retried = raw.replace(/(\d{1,2}:\d{2}(?::\d{2})?)\s+[A-Z]{2,5}(?=\s*(?:\(|$))/, '$1 +0000');
+      if (retried !== raw) ms = Date.parse(retried);
+    }
     return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
   }
 
@@ -335,7 +343,7 @@ export function applyPattern(
   body: string,
   entry: PatternEntry,
   dateCtx: DateContext,
-  diag?: { unrecognized_headings: string[] },
+  diag?: { unrecognized_headings: string[]; date_fallback_count?: number },
 ): MatchedMessage[] {
   if (!body) return [];
   const out: MatchedMessage[] = [];
@@ -410,8 +418,14 @@ export function applyPattern(
 
     const m = entry.regex.exec(line);
     if (m) {
-      const iso = buildIso(m, entry, runningCtx);
-      if (iso === null) continue; // reconstruction failed; skip line
+      let iso = buildIso(m, entry, runningCtx);
+      if (iso === null) {
+        // Reconstruction failed. Dropping the anchor would fold this
+        // message's body into the PREVIOUS speaker (silent misattribution),
+        // so open the message on the page's fallback date and count it.
+        iso = `${runningCtx.fallbackDate}T00:00:00Z`;
+        if (diag) diag.date_fallback_count = (diag.date_fallback_count ?? 0) + 1;
+      }
       const rawSpeaker = m[entry.captures.speaker_group] ?? '';
       const speaker = cleanSpeaker(rawSpeaker, entry.speaker_clean);
       let text = '';
@@ -611,7 +625,7 @@ export function parseConversation(
   if (opts.forcePatternId) {
     const forced = candidates.find((p) => p.id === opts.forcePatternId);
     if (forced) {
-      const diag = { unrecognized_headings: [] as string[] };
+      const diag = { unrecognized_headings: [] as string[], date_fallback_count: 0 };
       const messages = applyPattern(body, forced, dateCtx, diag);
       if (messages.length > 0) {
         return {
@@ -619,6 +633,7 @@ export function parseConversation(
           phase: 'regex_match',
           matched_pattern_id: forced.id,
           patterns_scored: 0,
+          date_fallback_count: diag.date_fallback_count || undefined,
           unrecognized_headings:
             diag.unrecognized_headings.length > 0 ? diag.unrecognized_headings : undefined,
         };
@@ -702,7 +717,7 @@ export function parseConversation(
     };
   }
 
-  const diag = { unrecognized_headings: [] as string[] };
+  const diag = { unrecognized_headings: [] as string[], date_fallback_count: 0 };
   const messages = applyPattern(body, top.entry, dateCtx, diag);
 
   // Timezone warning surface (D19).
@@ -721,6 +736,7 @@ export function parseConversation(
     matched_pattern_id: top.entry.id,
     patterns_scored: patternsScored,
     timezone_warning,
+    date_fallback_count: diag.date_fallback_count || undefined,
     // #4136 — populated unconditionally (NOT behind opts.diagnostic): the
     // extractor's decline gate depends on it. Undefined when empty.
     unrecognized_headings:

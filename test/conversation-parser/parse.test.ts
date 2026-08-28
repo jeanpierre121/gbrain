@@ -1429,3 +1429,51 @@ describe('parseConversation — email-thread-heading (gbrain email collector)', 
     expect(r.matched_pattern_id).not.toBe('email-thread-heading');
   });
 });
+
+describe('email-thread-heading — date edge cases (2026-08-28 review)', () => {
+  test('weekday-less GMT date parses', () => {
+    const r = parseConversation(
+      ['## unknown — 3 Jan 2024 09:00:00 GMT (received)', 'hello', '## Bob &lt;b@x.com&gt; — 3 Jan 2024 09:05:00 GMT (sent)', 'hi'].join('\n'),
+      { fallbackDate: '2026-01-01' },
+    );
+    expect(r.matched_pattern_id).toBe('email-thread-heading');
+    expect(r.messages[0].timestamp).toBe('2024-01-03T09:00:00.000Z');
+    expect(r.date_fallback_count).toBeUndefined();
+  });
+
+  test('a zone word the engine rejects is retried as a zero offset, never folded', () => {
+    const r = parseConversation(
+      ['## Alice &lt;a@x.com&gt; — Mon, 01 Jun 2026 09:00:00 CET (received)', 'alice body', '## Bob &lt;b@x.com&gt; — Mon, 01 Jun 2026 10:00:00 +0000 (sent)', 'bob body'].join('\n'),
+      { fallbackDate: '2026-01-01' },
+    );
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].timestamp.startsWith('2026-06-01T')).toBe(true);
+    expect(r.messages[0].text).toBe('alice body');
+    expect(r.messages[1].text).toBe('bob body');
+  });
+
+  test('an unparseable date opens a fallback-dated message instead of folding into the previous speaker', () => {
+    const r = parseConversation(
+      [
+        '## Alice &lt;a@x.com&gt; — Mon, 01 Jun 2026 09:00:00 +0000 (received)',
+        'alice body',
+        '## Bob &lt;b@x.com&gt; — Mon, 01 Xxx 2026 10:00:00 +0000 (sent)',
+        'bob body',
+      ].join('\n'),
+      { fallbackDate: '2026-05-30', forcePatternId: 'email-thread-heading' },
+    );
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].text).toBe('alice body');
+    expect(r.messages[1].speaker).toContain('Bob');
+    expect(r.messages[1].text).toBe('bob body');
+    expect(r.messages[1].timestamp).toBe('2026-05-30T00:00:00Z');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('an unknown forcePatternId falls through to scoring', () => {
+    const chat = ['**Alice Example** (2024-03-15 9:00 AM): morning', '**Bob Example** (2024-03-15 9:01 AM): hey there'].join('\n');
+    const r = parseConversation(chat, { forcePatternId: 'no-such-pattern' });
+    expect(r.matched_pattern_id).toBe('imessage-slack');
+    expect(r.messages).toHaveLength(2);
+  });
+});
