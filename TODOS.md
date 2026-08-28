@@ -6216,11 +6216,11 @@ keeping both skills' triggers intact for chaining.
 
 **Why:** A full enumeration transfers ~175 MB and discards 82% of it; on Modal the DB is a region away.
 
-**Context:** `PageFilters` (src/core/types.ts:298-312) has type/tag/limit/offset/updated_after only; `isSingleInboundEmail` in src/commands/extract-conversation-facts.ts. Both engines + tests.
+**Context:** `PageFilters` (src/core/types.ts) has no frontmatter predicate and no column projection (it carries type/tag/limit/offset/updated_after/updatedAfterKeyset/sort/slugPrefix/includeDeleted); `isOutOfScopeEmail` in src/commands/extract-conversation-facts.ts does the skip client-side after the full row arrives. Both engines + tests.
 
 **Effort:** M
 **Priority:** P2
-**Depends on:** Keyset generator enumeration (T2 of the 2026-08-28 review).
+**Depends on:** None (the keyset generator enumeration landed in 498d7804).
 
 ### Result-counter plumbing DRY in extract-conversation-facts
 
