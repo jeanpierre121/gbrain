@@ -6182,6 +6182,104 @@ keeping both skills' triggers intact for chaining.
 
 **Found:** 2026-04-24 during v0.19.0 production-readiness review.
 
+## Facts / email threads (filed on fork run/full-facts, 2026-08-28 eng review)
+
+### Entity-slug canonicalization pass after email pass 1
+
+**What:** One SQL pass that rewrites raw-name `facts.entity_slug` values to their canonical sibling when one exists (`ten-dev` -> `companies/ten-dev`, `isembard` -> `companies/isembard`, `Juan Andrade`/`Juan` -> `people/juan-andrade`), driven by a mapping table and a dry-run report first.
+
+**Why:** The upstream resolver mints raw and prefixed forms for the same entity, even for the same page across two runs (Oto: `people/edmund-farrar`, then `edmund-farrar`). `find_trajectory` is keyed on the exact slug, so one entity's timeline splits. Counts today: `Juan Andrade`=14,442, `Juan`=4,876, `people/juan-andrade`=1,755, `people/juan`=1,185; email facts 28% raw.
+
+**Context:** Save-time canonicalization (T4 of the 2026-08-28 review) stops new raw forms from the restart onward; this pass fixes what is already written (81k slack/meeting + email). Keep the mapping (old slug, new slug, fact_id) so it is reversible. Ambiguous first names need a manual list.
+
+**Effort:** M
+**Priority:** P1
+**Depends on:** Email pass 1 finishing; T4 landed.
+
+### Entity identity from email addresses
+
+**What:** Seed `entity_identities` (1 row today) from email pages' `frontmatter.participants` (name + address) so a sender address resolves to the existing address-slug person page (`people/ed-joinoto-com`) instead of a minted name slug.
+
+**Why:** Person pages use address slugs, facts use name slugs; they never join. The address is the one stable key, and `parseEmailSender` already produces it.
+
+**Context:** `entity_identities` table (schema v13x), `entity_identity_link` MCP op, `normalizeEmailMessages` has `EmailSender.address`. Needs either a resolver hint path or a pre-save mapping; one-time backfill over 43k pages.
+
+**Effort:** L
+**Priority:** P2
+**Depends on:** Canonicalization pass (canonical target slugs).
+
+### Push the single-inbound email skip into SQL
+
+**What:** A `frontmatter` predicate or a column projection on `listPages` so the ~35k single-inbound email pages are never fetched with their compiled_truth.
+
+**Why:** A full enumeration transfers ~175 MB and discards 82% of it; on Modal the DB is a region away.
+
+**Context:** `PageFilters` (src/core/types.ts:298-312) has type/tag/limit/offset/updated_after only; `isSingleInboundEmail` in src/commands/extract-conversation-facts.ts. Both engines + tests.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** Keyset generator enumeration (T2 of the 2026-08-28 review).
+
+### Result-counter plumbing DRY in extract-conversation-facts
+
+**What:** `emptyExtractResult()` factory plus a generic aggregate so a new counter is one edit, not five.
+
+**Why:** Adding two counters touched the interface, two inits, the aggregate, the print block, and the cycle literal in `src/core/cycle/conversation-facts-backfill.ts`.
+
+**Context:** Pure refactor in a file upstream edits every release; shape it as an upstream PR to avoid carrying it.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None.
+
+### Config-driven email sender denylist
+
+**What:** `facts.email.sender_denylist` config key merged with the generic patterns in `EMAIL_AUTOMATED_SENDERS`, so Caribou-specific domains (`webflow.com`, `jobsinnetwork.com`, `mail.zapier.com`) leave the generic file and a human at Webflow is not dropped.
+
+**Why:** Caribou data lives inside fork code that may be upstreamed.
+
+**Context:** `EMAIL_AUTOMATED_SENDERS` in src/commands/extract-conversation-facts.ts. Decision D2c of ~/gbrain-email-facts-plan.md.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None. Do before any upstream PR.
+
+### Upstream PR: email-thread parsing + async pool
+
+**What:** The generic parts of the 2026-08-27/28 email-facts change as one or two PRs to garrytan/gbrain: `email-thread-heading` builtin, rfc2822 date path + zone fallback, direction capture, `forcePatternId`, async-iterable `runSlidingPool`, `SplitSegmentsOpts.maxChars/minMessages`, `--model` + jobs.ts round trip, message chunking.
+
+**Why:** The fork carry grew by ~700 lines across 6 source files and conflicts with every upstream release; the pattern is generic (the LLM fallback prompt already lists `email-thread`).
+
+**Context:** Fork jeanpierre121/gbrain, branch run/full-facts (not pushed). Prior PRs #2341/#2357/#2427 landed.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** Config-driven denylist; 7A tests; T1/T2 implementation.
+
+### Private facts unreadable over the stdio MCP server
+
+**What:** `find_trajectory` and `recall` return zero facts for every entity through the stdio MCP server (PID 84930, started 2026-08-27 11:20 on the pre-upgrade code) while the trusted CLI path (`gbrain find-trajectory --entity-slug companies/caribou`) returns them; `facts.trust_local_reads=true`, no `.gbrain-source` pin, cwd = home.
+
+**Why:** The email-facts goal is that `think`/`find_trajectory` see commitments; through this pipe they see none.
+
+**Context:** src/mcp/server.ts:150-178 reads the trust config per call and resolves the stdio source scope. Memory says the path worked on 2026-08-25. First step: reconnect the MCP server (fresh process on the new code) and re-run the lookup; if still empty, bisect the scope resolution, then add a pin test.
+
+**Effort:** S-M
+**Priority:** P1
+**Depends on:** None.
+
+### The extraction CLI must survive a dead DB socket
+
+**What:** T1 (2026-08-28) crashed with `[uncaughtException] TypeError: null is not an object (evaluating 'socket.write')` in node_modules/postgres after the Mac's maintenance-sleep cycles killed the connection; 151 lock-refresh timeouts preceded it. Reconnect and retry the page instead of dying.
+
+**Why:** Multi-hour laptop runs will see a network blip; Modal benefits too.
+
+**Context:** src/core/db.ts disconnect path, src/core/db-lock.ts `refresh()`, `PER_PAGE_LOCK_TTL_MINUTES=2`. Mitigation used for the restart: `caffeinate -dims`, lid open, 16 workers.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** None.
+
 ## Completed
 
 ### ~~(v0.42.20.0 follow-up) Decouple the op-dispatch force-exit timer~~
