@@ -6424,17 +6424,20 @@ keeping both skills' triggers intact for chaining.
 
 **State:** carve branch `feat/email-thread-facts` (7 commits off origin/master c860a411, +3.1k/-165, 24 files) in the worktree `~/gbrain-pr-email` (node_modules symlinked to `~/gbrain`), pushed to `jeanpierre121/gbrain`. Two review cycles (5 CRITICAL fixed: ReDoS in the email regex, unscoped canonicalizer lookup, char-cut minimum bypass, producer error escaping the pool, keyset cursor precision). Watch the PR for the train's absorption; then merge upstream into run/full-facts and drop the fork's older versions of these files.
 
-### Private facts unreadable over the stdio MCP server
+### Private facts unreadable over the stdio MCP server — ROOT CAUSE FOUND 2026-08-29, one step left
 
-**What:** `find_trajectory` and `recall` return zero facts for every entity through the stdio MCP server (PID 84930, started 2026-08-27 11:20 on the pre-upgrade code) while the trusted CLI path (`gbrain find-trajectory --entity-slug companies/caribou`) returns them; `facts.trust_local_reads=true`, no `.gbrain-source` pin, cwd = home.
+**Root cause:** the stdio server (src/mcp/server.ts:184) serves private facts only when the brain config `facts.trust_local_reads` is `'true'`; the key was unset, so every stdio read was world-only by design (fail-closed). `gbrain config set facts.trust_local_reads true` was applied on 2026-08-29. The server reads the key at startup.
 
-**Why:** The email-facts goal is that `think`/`find_trajectory` see commitments; through this pipe they see none.
+**Left for Juan:** reconnect the MCP server (`/mcp` in Claude Code, or restart any `gbrain serve` process), then check `find_trajectory` for `companies/oto` over MCP: expected 38 points (all its facts are `private`; the CLI shows them, the pre-fix MCP call returned 0). Close this TODO when the count matches.
 
-**Context:** src/mcp/server.ts:150-178 reads the trust config per call and resolves the stdio source scope. Memory says the path worked on 2026-08-25. First step: reconnect the MCP server (fresh process on the new code) and re-run the lookup; if still empty, bisect the scope resolution, then add a pin test.
+### Owed by Juan after the 2026-08-29 go-live (window closed mid-session)
 
-**Effort:** S-M
-**Priority:** P1
-**Depends on:** None.
+- `/mcp` reconnect (above), then the TODO 7 count check.
+- `~/brain` email collector: escape a leading `#` on body lines (see "Email collector: escape body lines that look like a heading").
+- Watch garrytan/gbrain#4681 for the train; when it lands, merge upstream into run/full-facts and delete the worktree `~/gbrain-pr-email` (branch `feat/email-thread-facts`, keep until then).
+- Modal: re-run `! bash ~/brain-plane/setup-healthchecks.sh` (daily timeouts) and bump `notion_collector_full` timeout 21600 -> 28800 (open since 08-24).
+- Delete `~/gbrain-db-backup-2026-08-29.dump` (2.9 GB) once the v144 schema has run clean for a week; the 08-25 and 08-27 dumps can go now.
+- Codex CLI is logged in again (ChatGPT plan) as of 2026-08-29; nothing to do unless the refresh token is revoked again.
 
 ### The extraction CLI must survive a dead DB socket
 
