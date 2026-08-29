@@ -6448,15 +6448,9 @@ keeping both skills' triggers intact for chaining.
 **Priority:** P2
 **Depends on:** None.
 
-### Adopt the upstream carve on run/full-facts
+### Adopt the upstream carve on run/full-facts — DONE 2026-08-29
 
-**What:** Bring `feat/email-thread-facts` (PR #4681) into `run/full-facts`, replacing the fork's earlier versions of worker-pool.ts, the engines' keyset predicate, the parser email pattern and extract-conversation-facts.ts.
-
-**Why:** The fork (and Modal, via vendor rsync) still runs the pre-review code: the polynomial email regex (1.5 s per 2,000-space body line, attacker-controlled), the millisecond-bucket keyset predicate with a raw-column ORDER BY (can skip a page at a batch boundary inside one millisecond), the pool that leaves siblings running detached after a producer error, the canonicalizer that folds across sources, and the char-cut exemption that manufactures the segment minimum for a lone oversized message. Pass 1 is done, but the nightly cycle keeps calling the same core.
-
-**How:** either merge the carve branch (conflicts in the five reworked files: take the carve's version, then re-apply the fork-only bits: reader-trust bullets in KEY_FILES.md, the operations.ts import removal) or wait for the train to absorb #4681 and merge upstream. Then rsync + `modal deploy` (see the brain-plane runbook) and re-run `bun run test` with the fork's env guard.
-
-**Depends on:** #4681 absorbed, or a manual merge.
+**Done:** merge commit `c339f1d3` (feat/email-thread-facts at e6527ecc, carrying upstream v0.47.5.0) fast-forwarded onto run/full-facts; migrations v143 (dream_verdicts TTL) and v144 (open_loops) applied to the brain after a pg_dump backup (`~/gbrain-db-backup-2026-08-29.dump`, 2.9 GB); Modal vendor rsynced and redeployed the same hour. Fork suite on the merged tree: 22,506 pass, 3 known environmental failures. Dropped the fork-only `pageTypesForAllowed` test block (functions are upstream). PR #4681 CI green (28 success / 12 skipped).
 
 ### Persist the keyset cursor between extraction runs
 
