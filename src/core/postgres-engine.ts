@@ -37,7 +37,7 @@ import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatch
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { DREAM_VERDICT_TTL_SECONDS, MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { executeRawJsonb, type SqlValue } from './sql-query.ts';
 import { sanitizeForJsonb, sanitizeText, buildLinkRows, buildTimelineRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
@@ -89,6 +89,7 @@ import { privatePagesFilterFragment } from './search/private-visibility.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
@@ -1026,13 +1027,10 @@ export class PostgresEngine implements BrainEngine {
     // v0.45.7 keyset (updated_at, slug) supersedes updated_after when set.
     const keyset = filters?.updatedAfterKeyset;
     const updatedCondition = keyset
-      // The cursor comes from a JS Date (millisecond precision) while the
-      // column stores microseconds, so the tiebreak bucket is the cursor's
-      // whole millisecond: rows in that millisecond order by slug, rows in a
-      // later millisecond come after. A strict `>` on the raw column would
-      // re-select the last row of every batch (and stall on a batch of
-      // same-millisecond rows). Range form keeps the updated_at index usable.
-      ? sql`AND (p.updated_at >= ${keyset.updatedAt}::timestamptz + interval '1 millisecond' OR (p.updated_at >= ${keyset.updatedAt}::timestamptz AND p.updated_at < ${keyset.updatedAt}::timestamptz + interval '1 millisecond' AND p.slug > ${keyset.slug}))`
+      // Exact only when the cursor carries the column's microseconds: callers
+      // resume from `Page.updated_at_iso` (projected below), never from a JS
+      // Date, which would re-select every row in the last row's millisecond.
+      ? sql`AND (p.updated_at > ${keyset.updatedAt}::timestamptz OR (p.updated_at = ${keyset.updatedAt}::timestamptz AND p.slug > ${keyset.slug}))`
       : updatedAfter
         ? sql`AND p.updated_at > ${updatedAfter}::timestamptz`
         : sql``;
@@ -1077,7 +1075,7 @@ export class PostgresEngine implements BrainEngine {
     // `app.scopes` from filters; when disabled, it's a pass-through.
     return await this.withScopedReadTransaction(filters?.sourceIds, filters?.sourceId, async (tx) => {
       const rows = await tx`
-        SELECT p.* FROM pages p
+        SELECT p.*, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
         WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
@@ -2996,36 +2994,41 @@ export class PostgresEngine implements BrainEngine {
     const toSrc = opts?.toSourceId ?? 'default';
     const originSrc = opts?.originSourceId ?? 'default';
 
-    // Pre-check existence so we can throw a clear error (ON CONFLICT DO UPDATE
-    // returns 0 rows when source SELECT is empty, indistinguishable from missing
-    // page). Source-qualified — pre-v0.18 the bare slug check matched ANY source,
-    // letting addLink succeed even when the intended source row was missing.
-    const exists = await sql`
-      SELECT 1 FROM pages WHERE slug = ${from} AND source_id = ${fromSrc}
-      INTERSECT
-      SELECT 1 FROM pages WHERE slug = ${to} AND source_id = ${toSrc}
-    `;
-    if (exists.length === 0) {
-      throw new Error(`addLink failed: page "${from}" (source=${fromSrc}) or "${to}" (source=${toSrc}) not found`);
-    }
     // Default link_source to 'markdown' for back-compat with pre-v0.13 callers.
-    // Mirror addLinksBatch's VALUES + JOIN-on-(slug, source_id) shape. The old
-    // `FROM pages f, pages t` cross-product fanned out across every source
-    // containing either slug, so a multi-source brain silently created edges
-    // pointing at the wrong pages.
     const src = linkSource ?? 'markdown';
-    await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
-      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}))
-        AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
-      JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
-      JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
-      LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
-      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
-        context = EXCLUDED.context,
-        origin_field = EXCLUDED.origin_field
+    // #4109: resolve both required endpoints and upsert from ONE statement
+    // snapshot — a separate pre-check raced concurrent hard deletes (a delete
+    // winning between check and insert made a zero-row upsert look like
+    // success). The lookups stay source-qualified per endpoint (JOIN-on-
+    // (slug, source_id), not the pre-v0.18 cross-product that fanned out
+    // across sources containing either slug). FOR KEY SHARE makes a
+    // concurrent hard delete linearize around the mutation: a delete that
+    // wins first is observed as a missing endpoint; a mutation that wins
+    // first holds the referenced rows through the insert instead of leaking
+    // a raw FK violation.
+    const [result] = await sql`
+      WITH endpoint_state AS (
+        SELECT
+          (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc} FOR KEY SHARE) AS from_id,
+          (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc} FOR KEY SHARE) AS to_id,
+          (SELECT id FROM pages WHERE slug = ${originSlug ?? null} AND source_id = ${originSrc} FOR KEY SHARE) AS origin_id
+      ), upserted AS (
+        INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+        SELECT s.from_id, s.to_id, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, s.origin_id, ${originField ?? null}
+        FROM endpoint_state s
+        WHERE s.from_id IS NOT NULL AND s.to_id IS NOT NULL
+        ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
+          context = EXCLUDED.context,
+          origin_field = EXCLUDED.origin_field
+        RETURNING 1
+      )
+      SELECT
+        endpoint_state.from_id IS NOT NULL AS from_exists,
+        endpoint_state.to_id IS NOT NULL AS to_exists
+      FROM endpoint_state
     `;
+    if (!result?.from_exists) throw new PageMissingError('addLink', 'from', from, fromSrc);
+    if (!result.to_exists) throw new PageMissingError('addLink', 'to', to, toSrc);
   }
 
   async addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number> {
@@ -3704,10 +3707,10 @@ export class PostgresEngine implements BrainEngine {
     }));
   }
 
-  async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
-    const result = new Map<string, number>();
-    if (slugs.length === 0) return result;
-    for (const s of slugs) result.set(s, 0);
+  async getBacklinkCounts(pageIds: number[]): Promise<Map<number, number>> {
+    const result = new Map<number, number>();
+    if (pageIds.length === 0) return result;
+    for (const id of pageIds) result.set(id, 0);
 
     // v0.41.18.0 D12: filter mentions OUT of backlink-count for search
     // ranking. `link_source='mentions'` rows are auto-linked body-text
@@ -3717,17 +3720,19 @@ export class PostgresEngine implements BrainEngine {
     // --by-mention run, boosting popular-mention pages over intentional-
     // backlink pages. `IS DISTINCT FROM` is NULL-safe so legacy rows with
     // NULL link_source still count (NULL != 'mentions' → row included).
+    // #4380: keyed by p.id, not slug — grouping by bare slug summed every
+    // namesake's backlinks across sources, boosting zero-backlink pages.
     const sql = this.sql;
     const rows = await sql`
-      SELECT p.slug as slug, COUNT(l.id)::int as cnt
+      SELECT p.id as page_id, COUNT(l.id)::int as cnt
       FROM pages p
       LEFT JOIN links l ON l.to_page_id = p.id
         AND l.link_source IS DISTINCT FROM 'mentions'
-      WHERE p.slug = ANY(${slugs}::text[])
-      GROUP BY p.slug
+      WHERE p.id = ANY(${pageIds}::int[])
+      GROUP BY p.id
     `;
-    for (const r of rows as unknown as { slug: string; cnt: number }[]) {
-      result.set(r.slug, Number(r.cnt));
+    for (const r of rows as unknown as { page_id: number; cnt: number }[]) {
+      result.set(Number(r.page_id), Number(r.cnt));
     }
     return result;
   }
@@ -3998,31 +4003,38 @@ export class PostgresEngine implements BrainEngine {
   ): Promise<boolean> {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
-    if (!opts?.skipExistenceCheck) {
-      const exists = await sql`SELECT 1 FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}`;
-      if (exists.length === 0) {
-        throw new Error(`addTimelineEntry failed: page "${slug}" (source=${sourceId}) not found`);
-      }
-    }
-    // ON CONFLICT DO NOTHING via the (page_id, date, md5(summary), source)
-    // unique index (#3737: md5-keyed so long summaries fit the btree row cap).
-    // #3827: RETURNING 1 makes the outcome observable — 0 rows means either
-    // page missing OR duplicate; with the existence check above (default) the
-    // false return unambiguously means "deduplicated", and under
-    // skipExistenceCheck the caller asserts the page exists. Source-qualify
-    // the page-id lookup so multi-source brains don't fan timeline rows out
-    // across every source containing the slug.
+    // #4109: page resolution and insertion share ONE statement snapshot, so a
+    // concurrent hard delete linearizes before the lookup (missing) or after
+    // the insert (success) instead of surfacing a raw FK violation; FOR KEY
+    // SHARE holds the referenced row through the insert. ON CONFLICT DO
+    // NOTHING via the (page_id, date, md5(summary), source) unique index
+    // (#3737: md5-keyed so long summaries fit the btree row cap).
+    // #3827: the `inserted` flag makes the outcome observable — with the
+    // page_exists throw below (default) a false return unambiguously means
+    // "deduplicated", and under skipExistenceCheck the caller asserts the
+    // page exists. Source-qualify the page-id lookup so multi-source brains
+    // don't fan timeline rows out across every source containing the slug.
     // Free-text body fields are NUL + lone-surrogate sanitized (#2011) so a
     // surrogate from sliced/imported content can't reach the (later) ::jsonb
     // batch path or corrupt the row; identity fields (slug, date) are left raw.
-    const inserted = await sql`
-      INSERT INTO timeline_entries (page_id, date, source, summary, detail)
-      SELECT id, ${entry.date}::date, ${sanitizeForJsonb(entry.source || '')}, ${sanitizeForJsonb(entry.summary)}, ${sanitizeForJsonb(entry.detail || '')}
-      FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}
-      ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING
-      RETURNING 1
+    const [result] = await sql`
+      WITH page_state AS (
+        SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId} FOR KEY SHARE
+      ), inserted AS (
+        INSERT INTO timeline_entries (page_id, date, source, summary, detail)
+        SELECT id, ${entry.date}::date, ${sanitizeForJsonb(entry.source || '')}, ${sanitizeForJsonb(entry.summary)}, ${sanitizeForJsonb(entry.detail || '')}
+        FROM page_state
+        ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING
+        RETURNING 1
+      )
+      SELECT
+        EXISTS(SELECT 1 FROM page_state) AS page_exists,
+        EXISTS(SELECT 1 FROM inserted) AS inserted
     `;
-    return inserted.length > 0;
+    if (!result?.page_exists && !opts?.skipExistenceCheck) {
+      throw new PageMissingError('addTimelineEntry', 'page', slug, sourceId);
+    }
+    return result?.inserted === true;
   }
 
   async addTimelineEntriesBatch(entries: TimelineBatchInput[], opts?: BatchOpts): Promise<number> {
@@ -4082,13 +4094,13 @@ export class PostgresEngine implements BrainEngine {
   // JOIN event page; hide soft-deleted event projections (read-time, not just
   // doctor); order by COALESCE(event effective_date, date) for intra-day
   // sequence. Source scope: federated sourceIds[] > scalar sourceId > unscoped.
-  private chronicleSourceCond(opts?: { sourceId?: string; sourceIds?: string[] }) {
+  // ep=true: the ep LEFT JOIN carries the same scope so out-of-scope event fields null out (#2200 origin-join shape).
+  private chronicleSourceCond(opts?: { sourceId?: string; sourceIds?: string[] }, ep = false) {
     const sql = this.sql;
-    return opts?.sourceIds && opts.sourceIds.length > 0
-      ? sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`
-      : opts?.sourceId
-        ? sql`AND p.source_id = ${opts.sourceId}`
-        : sql``;
+    if (opts?.sourceIds && opts.sourceIds.length > 0)
+      return ep ? sql`AND ep.source_id = ANY(${opts.sourceIds}::text[])` : sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`;
+    if (opts?.sourceId) return ep ? sql`AND ep.source_id = ${opts.sourceId}` : sql`AND p.source_id = ${opts.sourceId}`;
+    return sql``;
   }
 
   async getTimelineForDate(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]> {
@@ -4105,7 +4117,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE te.date >= ${lower} AND te.date <= ${upper}
         AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         ${this.chronicleSourceCond(opts)}
@@ -4126,7 +4138,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE te.date >= ${date}::date
         AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         ${kindCond}
@@ -4148,7 +4160,7 @@ export class PostgresEngine implements BrainEngine {
              ep.frontmatter->'event'->>'kind' AS kind
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM ${target})
         AND EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM ${target})
         AND te.date < ${target}
@@ -4172,7 +4184,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT te.date::text AS last_date, ep.slug AS last_event_slug
       FROM timeline_entries te
       JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-      LEFT JOIN pages ep ON ep.id = te.event_page_id
+      LEFT JOIN pages ep ON ep.id = te.event_page_id ${this.chronicleSourceCond(opts, true)}
       WHERE (te.event_page_id IS NULL OR ep.deleted_at IS NULL)
         AND te.date <= ${seenThrough}
         AND (
@@ -4266,7 +4278,7 @@ export class PostgresEngine implements BrainEngine {
         // Close the prior row's valid window at the new fact's valid_from (or now()).
         await sql`UPDATE facts SET valid_until = COALESCE(${validFrom}::timestamptz, now()), superseded_by = ${newId}
                    WHERE id = ${current.id} AND valid_until IS NULL`;
-        supersededId = current.id;
+        supersededId = Number(current.id);
       }
     }
     return { action: supersededId ? 'superseded_prior' : 'inserted', factId: newId, supersededId };
@@ -4472,6 +4484,8 @@ export class PostgresEngine implements BrainEngine {
              score, content_type, segments, entities, model, triage_version
       FROM dream_verdicts
       WHERE file_path = ${filePath} AND content_hash = ${contentHash}
+        -- NULL = pre-TTL row in the #4657 bootstrap window; a miss here re-judges the corpus
+        AND (expires_at IS NULL OR expires_at > now())
     `;
     if (rows.length === 0) return null;
     const r = rows[0];
@@ -4490,12 +4504,16 @@ export class PostgresEngine implements BrainEngine {
 
   async putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void> {
     const sql = this.sql;
+    // Expiry is computed server-side (now() + TTL) so it lives on the same
+    // clock as the `expires_at > now()` read predicate and judged_at.
     await sql`
       INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons,
-                                  score, content_type, segments, entities, model, triage_version)
+                                  score, content_type, segments, entities, model, triage_version,
+                                  expires_at)
       VALUES (${filePath}, ${contentHash}, ${verdict.worth_processing}, ${sql.json(verdict.reasons as Parameters<typeof sql.json>[0])},
               ${verdict.score}, ${verdict.content_type}, ${sql.json(verdict.segments as unknown as Parameters<typeof sql.json>[0])},
-              ${sql.json(verdict.entities as Parameters<typeof sql.json>[0])}, ${verdict.model}, ${verdict.triage_version})
+              ${sql.json(verdict.entities as Parameters<typeof sql.json>[0])}, ${verdict.model}, ${verdict.triage_version},
+              now() + make_interval(secs => ${DREAM_VERDICT_TTL_SECONDS}))
       ON CONFLICT (file_path, content_hash) DO UPDATE SET
         worth_processing = EXCLUDED.worth_processing,
         reasons = EXCLUDED.reasons,
@@ -4505,8 +4523,15 @@ export class PostgresEngine implements BrainEngine {
         entities = EXCLUDED.entities,
         model = EXCLUDED.model,
         triage_version = EXCLUDED.triage_version,
-        judged_at = now()
+        judged_at = now(),
+        expires_at = EXCLUDED.expires_at
     `;
+  }
+
+  async sweepDreamVerdicts(): Promise<number> {
+    const sql = this.sql;
+    const result = await sql`DELETE FROM dream_verdicts WHERE expires_at <= now()`;
+    return result.count ?? 0;
   }
 
   // ============================================================

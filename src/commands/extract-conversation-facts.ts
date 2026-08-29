@@ -34,11 +34,15 @@
  *   - Streaming enumeration. `claimablePages()` (an async generator) walks
  *     each page type with keyset pagination (`updated_at ASC, slug`, so a
  *     page a collector touches mid-run moves later in the walk instead of
- *     being skipped), drops out-of-scope pages, runs ONE durable-outcome
+ *     being skipped; oldest-updated first, and every run restarts from the
+ *     oldest page because the cursor is not persisted between runs, so a
+ *     capped run under the cycle walltime or --limit takes the oldest
+ *     claimable pages), drops out-of-scope pages, runs ONE durable-outcome
  *     lookup per accumulated candidate set, and feeds `runSlidingPool`
  *     lazily. Memory is bounded by `workers` in-flight pages + one
- *     candidate set (<= 2 x workers pages), never by the corpus.
- *     Per-page body cap drops oversize before parsing.
+ *     candidate set (max(PAGE_LIST_BATCH, 2 x workers), capped at
+ *     MAX_CANDIDATE_BATCH, plus at most one list read of overflow), never
+ *     by the corpus. Per-page body cap drops oversize before parsing.
  *
  *     Email thread pages (type `email`, collector format) take this path:
  *
@@ -104,7 +108,39 @@ import {
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
 import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
-import { canonicalLookup } from '../core/model-pricing.ts';
+import {
+  EMAIL_SEGMENT_GAP_MINUTES,
+  DEFAULT_SEGMENT_MAX_CHARS,
+  EMAIL_THREAD_PATTERN_ID,
+  EMAIL_AUTOMATED_SENDERS,
+  compileEmailSenderDenylist,
+  loadEmailSenderDenylist,
+  countEmailAnchorLines,
+  normalizeEmailMessages,
+  isOutOfScopeEmail,
+  type EmailSenderRule,
+} from './extract-conversation-facts/email.ts';
+import { EntitySlugCanonicalizer } from './extract-conversation-facts/entity-slug-canonicalizer.ts';
+import { validateModelFlag } from './extract-conversation-facts/model-flag.ts';
+export {
+  EMAIL_SEGMENT_GAP_MINUTES,
+  DEFAULT_SEGMENT_MAX_CHARS,
+  EMAIL_THREAD_PATTERN_ID,
+  EMAIL_AUTOMATED_SENDERS,
+  EMAIL_AUTOMATED_SENDERS_CONFIG_KEY,
+  compileEmailSenderDenylist,
+  countEmailAnchorLines,
+  parseEmailSender,
+  isAutomatedEmailSender,
+  normalizeEmailMessages,
+  isSingleInboundEmail,
+  isOutOfScopeEmail,
+  type EmailSender,
+  type EmailSenderRule,
+  type NormalizedEmailMessages,
+} from './extract-conversation-facts/email.ts';
+export { slugBasename, EntitySlugCanonicalizer } from './extract-conversation-facts/entity-slug-canonicalizer.ts';
+export { validateModelFlag } from './extract-conversation-facts/model-flag.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
   loadOpCheckpoint,
@@ -166,44 +202,6 @@ export const DEFAULT_SEGMENT_MAX_MESSAGES = 30;
 
 /** Minimum messages required for a segment to be worth extracting. */
 export const MIN_SEGMENT_MESSAGES = 2;
-
-/**
- * Email threads: replies arrive over days, not minutes, so the episode gap is
- * a week. Facts are dated at their segment's start (claim-time dating), so a
- * wider gap would date a reply months early; a narrower one would fragment
- * a normal back-and-forth. Episodes of a real thread are all kept, even a
- * one-message episode (see the email branch in processPage).
- */
-export const EMAIL_SEGMENT_GAP_MINUTES = 60 * 24 * 7;
-
-/**
- * Rendered-body char budget per segment. Keeps every segment under
- * SEGMENT_TEXT_CHAR_LIMIT with headroom for the header, so a long thread
- * splits into more segments instead of losing its tail to truncation.
- * Opt-in via SplitSegmentsOpts.maxChars (the email path); other types keep
- * the historical message-count-only cut.
- */
-export const DEFAULT_SEGMENT_MAX_CHARS = 5800;
-
-/** Pattern id the email path forces (see ParseConversationOpts.forcePatternId). */
-export const EMAIL_THREAD_PATTERN_ID = 'email-thread-heading';
-
-/**
- * Senders whose messages carry no conversational facts: comment/notification
- * relays, bounce and no-reply addresses, form submissions, job boards. Tested
- * against the lowercased address (or the name when no address parsed) and
- * dropped before segmenting, so a thread with one human reply keeps the
- * human messages only.
- */
-export const EMAIL_AUTOMATED_SENDERS: readonly RegExp[] = [
-  /(?:^|[._+-])(?:no-?reply|do-?not-?reply)@/,
-  /^(?:notifications?|notify|mailer-daemon|bounces?|postmaster|alerts?|calendar-notification)[@._+-]/,
-  /@docs\.google\.com$/,
-  /@calendar-server\.bounces\.google\.com$/,
-  /@mail\.zapier\.com$/,
-  /@webflow\.com$/,
-  /@jobsinnetwork\.com$/,
-];
 
 // #4136 — labels that are common DOCUMENT section headings, never lost
 // speakers. Gate the DECLINE only (a miss here is warn-noise on healthy
@@ -287,11 +285,19 @@ export function pageTypesForAllowed(types: readonly AllowedType[]): string[] {
 }
 
 /**
- * Pagination batch size for listPages enumeration. Per-batch memory
- * worst case = BATCH × MAX_PAGE_BODY_BYTES = 250MB at default 10
- * (Eng-v2 C8 — bounded vs PR's unbounded listPages limit:500 = 12.5GB).
+ * listPages read size for enumeration (Eng-v2 C8 — bounded vs PR's
+ * unbounded listPages limit:500 = 12.5GB). The memory bound is no longer a
+ * function of this value alone: enumeration holds one candidate set of up
+ * to `max(PAGE_LIST_BATCH, 2 x workers)` pages (capped at
+ * MAX_CANDIDATE_BATCH) plus at most one list read of overflow, and the pool
+ * holds `workers` pages in flight. Worst case at 16 workers is
+ * (32 + 9 + 16) x MAX_PAGE_BODY_BYTES; the cap keeps --workers 64 at
+ * (64 + 9 + 64) x MAX_PAGE_BODY_BYTES instead of growing without bound.
  */
 export const PAGE_LIST_BATCH = 10;
+
+/** Upper bound on one accumulated candidate set (see PAGE_LIST_BATCH). */
+export const MAX_CANDIDATE_BATCH = 64;
 
 /** Op name for the checkpoint primitive. */
 export const CHECKPOINT_OP = 'extract-conversation-facts';
@@ -319,6 +325,12 @@ export interface ConversationMessage {
   /** ISO 8601 timestamp parsed from the rendered message line. */
   timestamp: string;
   text: string;
+  /**
+   * Message direction when the page format carries it (email threads:
+   * `sent` by the brain owner, `received`). Rendered into the segment line
+   * so the extractor can tell the owner's statements from inbound claims.
+   */
+  direction?: 'sent' | 'received';
 }
 
 export interface ConversationSegment {
@@ -392,6 +404,13 @@ export interface ExtractConversationFactsCoreOpts {
   /** Extractor chat model override (e.g. openai:gpt-5.6-sol). Default: facts.extraction_model, else the reasoning tier. */
   model?: string;
   /**
+   * Extra automated-sender rules for email pages (address suffixes such as
+   * `@relay.example`, or substrings), merged with EMAIL_AUTOMATED_SENDERS.
+   * Default: the `facts.email_automated_senders` config key (a JSON array),
+   * else the built-in list only.
+   */
+  emailAutomatedSenders?: readonly string[];
+  /**
    * Injectable per-segment extractor (BrainBench decision 15). When unset,
    * the production path is `extractFactsFromTurnWithOutcome` (fail-hard: a
    * per-segment extraction failure aborts the page). The bench's deterministic
@@ -413,8 +432,8 @@ export interface ExtractConversationFactsResult {
   pages_skipped_non_extractable: number;
   /** Durable scanned-not-extractable outcomes written by this run. */
   pages_marked_non_extractable: number;
-  /** Out-of-scope email pages (single inbound message, digest subtype) skipped before the durable lookup (never audited). */
-  pages_skipped_single_inbound_email: number;
+  /** Out-of-scope email pages (single inbound message, digest subtype or type) skipped before the durable lookup (never audited). */
+  pages_skipped_out_of_scope_email: number;
   /** Email messages dropped by EMAIL_AUTOMATED_SENDERS before segmenting. */
   email_messages_dropped_automated: number;
   /** Raw entity slugs folded onto an existing people/ or companies/ sibling at save time. */
@@ -478,7 +497,7 @@ import {
 } from '../core/conversation-parser/parse.ts';
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
-import { resolveModel } from '../core/model-config.ts';
+import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
 
 /**
  * v0.41.13.0 — back-compat shape for direct callers + the existing
@@ -539,11 +558,14 @@ export function splitIntoSegments(
   let curChars = 0;
   // Both sides of a char cut continue one conversation, so neither side is
   // held to the minimum: the closed segment already has a successor, the
-  // opened segment already has a predecessor.
+  // opened segment already has a predecessor. The exemption exists for a
+  // conversation that meets the minimum on its own; chunking one oversized
+  // lone message into several pseudo-messages must not manufacture it.
+  const conversationQualifies = filtered.length >= minMessages;
   let openedByCharCut = false;
   let closingByCharCut = false;
   const flush = () => {
-    const min = openedByCharCut || closingByCharCut ? 1 : minMessages;
+    const min = (openedByCharCut || closingByCharCut) && conversationQualifies ? 1 : minMessages;
     openedByCharCut = false;
     closingByCharCut = false;
     curChars = 0;
@@ -576,20 +598,20 @@ export function splitIntoSegments(
         ? splitOversizedMessage(original, maxChars)
         : [original];
     for (const m of parts) {
-    if (lastTs !== null && ts - lastTs > gapMs) flush();
-    const chars = renderedMessageChars(m);
-    if (maxChars !== undefined && cur.length > 0 && curChars + chars > maxChars) {
-      closingByCharCut = true;
-      flush();
-      openedByCharCut = true;
-    }
-    cur.push(m);
-    curChars += chars;
-    lastTs = ts;
-    if (cur.length >= maxMessages) {
-      flush();
-      lastTs = null;
-    }
+      if (lastTs !== null && ts - lastTs > gapMs) flush();
+      const chars = renderedMessageChars(m);
+      if (maxChars !== undefined && cur.length > 0 && curChars + chars > maxChars) {
+        closingByCharCut = true;
+        flush();
+        openedByCharCut = true;
+      }
+      cur.push(m);
+      curChars += chars;
+      lastTs = ts;
+      if (cur.length >= maxMessages) {
+        flush();
+        lastTs = null;
+      }
     }
   }
   flush();
@@ -618,9 +640,16 @@ export function renderSegmentForExtraction(
   return `${header}\n${body.slice(0, Math.max(0, slack))}\n…(truncated)`;
 }
 
-/** One message as it appears in the extractor's segment body. Single source of truth for the char budget. */
+/**
+ * One message as it appears in the extractor's segment body. Single source of
+ * truth for the char budget. Direction, when known, sits next to the speaker
+ * (`Sam Example [sent] (2026-06-18T07:46:32.000Z): ...`): an inbound email
+ * with a spoofed display name then reads as a received claim, not as the
+ * owner's own statement.
+ */
 export function renderMessageLine(m: ConversationMessage): string {
-  return `${m.speaker} (${m.timestamp}): ${m.text}`;
+  const direction = m.direction ? ` [${m.direction}]` : '';
+  return `${m.speaker}${direction} (${m.timestamp}): ${m.text}`;
 }
 
 /** Chars one message occupies in renderSegmentForExtraction's body (line + newline). */
@@ -652,204 +681,6 @@ export function splitOversizedMessage<M extends ConversationMessage>(m: M, maxCh
   }
   if (rest) parts.push({ ...m, text: rest });
   return parts;
-}
-
-// ---------------------------------------------------------------------------
-// Email thread pages (collector format, see EMAIL_THREAD_PATTERN_ID).
-// ---------------------------------------------------------------------------
-
-const HTML_ENTITY_RE = /&(lt|gt|amp|quot|#39);/g;
-const HTML_ENTITY_MAP: Record<string, string> = {
-  lt: '<',
-  gt: '>',
-  amp: '&',
-  quot: '"',
-  '#39': "'",
-};
-function decodeEntities(s: string): string {
-  return s.replace(HTML_ENTITY_RE, (_, k: string) => HTML_ENTITY_MAP[k] ?? '');
-}
-const OPEN_IN_GMAIL_RE = /^\[Open in Gmail\]\([^)]*\)\s*$/;
-const EMAIL_SENT_HEADING_RE = /^##\s.*\(sent\)\s*$/m;
-
-export interface EmailSender {
-  name: string;
-  address: string | null;
-}
-
-/** Split the collector's HTML-escaped `Name <addr>` into display name + address. */
-export function parseEmailSender(raw: string): EmailSender {
-  // The collector's escapeMd emits `&lt;`/`&gt;` and backslash-escaped `[`/`]`.
-  const decoded = decodeEntities(raw).replace(/\\([\[\]])/g, '$1').trim();
-  const m = /^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.exec(decoded);
-  if (m) {
-    const name = m[1].trim().replace(/^"(.*)"$/, '$1').trim();
-    return { name: name || m[2], address: m[2].toLowerCase() };
-  }
-  if (/^[^\s<>]+@[^\s<>]+$/.test(decoded)) {
-    return { name: decoded, address: decoded.toLowerCase() };
-  }
-  const name = decoded.replace(/^"(.*)"$/, '$1').trim();
-  return { name: name || 'unknown', address: null };
-}
-
-export function isAutomatedEmailSender(sender: EmailSender): boolean {
-  const probe = sender.address ?? sender.name.toLowerCase();
-  return EMAIL_AUTOMATED_SENDERS.some((re) => re.test(probe));
-}
-
-export interface NormalizedEmailMessages {
-  messages: MatchedMessage[];
-  /** Messages dropped because their sender is automated. */
-  dropped: number;
-  /** True when exactly one message remains and the brain owner sent it. */
-  soloSent: boolean;
-}
-
-/**
- * Email-page post-parse normalization:
- *   - speaker `Name &lt;addr&gt;` -> display name (the address only drives policy)
- *   - automated senders dropped before segmenting
- *   - `[Open in Gmail](...)` link lines stripped from bodies
- */
-export function normalizeEmailMessages(
-  messages: readonly MatchedMessage[],
-): NormalizedEmailMessages {
-  const out: MatchedMessage[] = [];
-  let dropped = 0;
-  for (const m of messages) {
-    const sender = parseEmailSender(m.speaker);
-    if (isAutomatedEmailSender(sender)) {
-      dropped++;
-      continue;
-    }
-    const text = m.text
-      .split(/\r?\n/)
-      .filter((line) => !OPEN_IN_GMAIL_RE.test(line.trim()))
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    out.push(
-      m.direction !== undefined
-        ? { speaker: sender.name, timestamp: m.timestamp, text, direction: m.direction }
-        : { speaker: sender.name, timestamp: m.timestamp, text },
-    );
-  }
-  return {
-    messages: out,
-    dropped,
-    soloSent: out.length === 1 && out[0].direction === 'sent',
-  };
-}
-
-/**
- * Email pages with a single inbound message (newsletters, notifications,
- * one-off sends to the owner) are out of scope for conversation facts. Cheap
- * pre-parse check on frontmatter + the heading marker, so enumeration skips
- * them for the cost of one list read and writes no durable audit row.
- */
-export function isSingleInboundEmail(
-  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
-): boolean {
-  if (page.type !== 'email') return false;
-  const raw = page.frontmatter?.message_count;
-  const count = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? ''), 10);
-  if (!Number.isFinite(count) || count >= 2) return false;
-  return !EMAIL_SENT_HEADING_RE.test(page.compiled_truth ?? '');
-}
-
-/**
- * Email pages the facts pipeline never extracts: the collector's daily digest
- * pages (`frontmatter.subtype` other than `thread`, e.g. `digest`, whose body
- * is `## Signatures pending` / `## Triage` sections, not messages) and single
- * inbound messages. Enumeration skips both before parsing and writes no
- * audit row.
- */
-export function isOutOfScopeEmail(
-  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
-): boolean {
-  if (page.type !== 'email') return false;
-  const subtype = page.frontmatter?.subtype;
-  if (typeof subtype === 'string' && subtype !== 'thread') return true;
-  return isSingleInboundEmail(page);
-}
-
-// ---------------------------------------------------------------------------
-// Save-time entity-slug canonicalization.
-// ---------------------------------------------------------------------------
-
-/** Basename form the resolver's fallback_slugify produces (`Edmund Farrar` -> `edmund-farrar`). */
-export function slugBasename(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/['']/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-/**
- * The shipped resolver cascade mints BOTH `people/edmund-farrar` and
- * `edmund-farrar` for the same person, sometimes on the same page across two
- * runs, so `find_trajectory` (keyed on the exact slug) splits one timeline.
- * This folds a raw slug onto an existing prefixed sibling (`people/` or
- * `companies/`, from person/company pages and from facts already written)
- * when exactly one sibling exists. Raw slugs with no sibling stay raw;
- * ambiguous ones (both prefixes) stay raw. Prefixed slugs register their
- * basename so later raw forms in the same run fold onto them.
- */
-export class EntitySlugCanonicalizer {
-  private readonly byBase = new Map<string, string>();
-  private readonly ambiguous = new Set<string>();
-
-  static async load(engine: BrainEngine, sourceId: string): Promise<EntitySlugCanonicalizer> {
-    const c = new EntitySlugCanonicalizer();
-    try {
-      const pages = await engine.executeRaw<{ slug: string }>(
-        `SELECT slug FROM pages
-          WHERE deleted_at IS NULL
-            AND (slug LIKE 'people/%' OR slug LIKE 'companies/%')`,
-      );
-      for (const r of pages) c.register(r.slug);
-      const facts = await engine.executeRaw<{ entity_slug: string }>(
-        `SELECT DISTINCT entity_slug FROM facts
-          WHERE source_id = $1
-            AND (entity_slug LIKE 'people/%' OR entity_slug LIKE 'companies/%')`,
-        [sourceId],
-      );
-      for (const r of facts) c.register(r.entity_slug);
-    } catch (err) {
-      process.stderr.write(
-        `[extract-conversation-facts] slug canonicalizer load failed (${err instanceof Error ? err.message : String(err)}); raw slugs stay raw this run\n`,
-      );
-    }
-    return c;
-  }
-
-  /** Remember a prefixed slug. Two prefixes for one basename mark it ambiguous. */
-  register(prefixed: string): void {
-    const i = prefixed.indexOf('/');
-    if (i <= 0) return;
-    const base = prefixed.slice(i + 1);
-    const known = this.byBase.get(base);
-    if (known === undefined) this.byBase.set(base, prefixed);
-    else if (known !== prefixed) this.ambiguous.add(base);
-  }
-
-  /** Canonical slug for an extractor/resolver output; null/undefined pass through. */
-  canonicalize(slug: string | null | undefined): string | null | undefined {
-    if (!slug) return slug;
-    if (slug.includes('/')) {
-      this.register(slug);
-      return slug;
-    }
-    const base = slugBasename(slug);
-    if (!base || this.ambiguous.has(base)) return slug;
-    return this.byBase.get(base) ?? slug;
-  }
-
-  get size(): number {
-    return this.byBase.size;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +917,8 @@ interface ExtractCoreState {
   model: string | null;
   /** Save-time raw-slug folding onto existing prefixed siblings. */
   canonicalizer: EntitySlugCanonicalizer;
+  /** Email sender denylist for this run (defaults + config). */
+  emailDenylist: readonly EmailSenderRule[];
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -1302,12 +1135,28 @@ async function processPage(
   // A multi-speaker page with folds is warn-only (residual risk, visible).
   // phase stays 'regex_match', so the LLM fallback gate below stays closed.
   // Email anchors carry an explicit direction marker, so a folded `## ` line is
-  // body content (a forwarded newsletter section), never a lost speaker.
+  // body content (a forwarded newsletter section), never a lost speaker. The
+  // guard for email is the anchor count instead: every heading in the
+  // collector's full shape must have become a message, or a date shape the
+  // pattern does not know would fold one sender's words into another's.
   const foldedHeadings = isEmail ? [] : (parseResult.unrecognized_headings ?? []);
   const speakerShapedFolds = foldedHeadings.filter(isSpeakerShapedHeadingLabel);
-  const declinedUnrecognizedSpeaker =
+  // `let`: the email anchor-count guard below is the same non-terminal
+  // decline (no audit row; the page retries once the parser learns the shape).
+  let declinedUnrecognizedSpeaker =
     speakerShapedFolds.length > 0 &&
     new Set(messages.map((m) => m.speaker)).size < 2;
+  if (isEmail && parseResult.matched_pattern_id === EMAIL_THREAD_PATTERN_ID) {
+    const anchorLines = countEmailAnchorLines(body);
+    if (parseResult.messages.length < anchorLines) {
+      process.stderr.write(
+        `[extract-conversation-facts] ${page.slug}: ${anchorLines} heading line(s) but ${parseResult.messages.length} parsed message(s); declining extraction (a heading the pattern rejected would fold into the previous sender)\n`,
+      );
+      state.result.pages_skipped_unrecognized_speaker++;
+      declinedUnrecognizedSpeaker = true;
+      messages = [];
+    }
+  }
   if (foldedHeadings.length > 0) {
     const detail =
       `pattern=${parseResult.matched_pattern_id} folded unrecognized heading(s) ` +
@@ -1327,8 +1176,12 @@ async function processPage(
   // The fallback runs only for a true built-in miss. It never replaces or
   // polishes a deterministic parse, and it remains unreachable unless the
   // operator explicitly enables conversation_parser.llm_fallback_enabled.
+  // Email pages never take the fallback: only the forced collector pattern
+  // carries direction and sender shape, so fallback messages would be
+  // discarded below and the model call wasted.
   if (
     !state.dryRun &&
+    !isEmail &&
     messages.length === 0 &&
     parseResult.phase === 'no_match' &&
     state.llmFallbackModel
@@ -1353,18 +1206,28 @@ async function processPage(
   }
   let segmentOpts: SplitSegmentsOpts = {};
   if (isEmail) {
-    const normalized = normalizeEmailMessages(messages);
+    // Only the collector's thread format carries direction and sender
+    // shape; an email page some other pattern matched (section headings of a
+    // digest named with --slug) is not a thread we can attribute.
+    if (parseResult.matched_pattern_id !== EMAIL_THREAD_PATTERN_ID) messages = [];
+    const normalized = normalizeEmailMessages(messages, state.emailDenylist);
     state.result.email_messages_dropped_automated += normalized.dropped;
     messages = normalized.messages;
-    // The thread is the conversation: once it has two human messages (or one
-    // the owner sent), every episode is worth extracting, including a lone
-    // reply weeks later. A single inbound message stays below the minimum.
+    // The thread is the conversation once the owner took part (any `sent`
+    // message, a lone one included) or two distinct humans exchanged mail;
+    // then every episode is worth extracting, including a lone reply weeks
+    // later. Two issues of one newsletter share a sender and stay below the
+    // minimum, as does a single inbound message.
     const threadQualifies =
-      normalized.messages.length >= MIN_SEGMENT_MESSAGES || normalized.soloSent;
+      normalized.messages.some((m) => m.direction === 'sent') || normalized.distinctSenders >= 2;
+    // A thread that does not qualify keeps no segment, whatever its message
+    // count: it takes the zero-segment path below ("fewer than two eligible
+    // messages") and is audited as scanned-not-extractable, so the next run
+    // skips it durably.
     segmentOpts = {
       gapMinutes: EMAIL_SEGMENT_GAP_MINUTES,
       maxChars: DEFAULT_SEGMENT_MAX_CHARS,
-      minMessages: threadQualifies ? 1 : MIN_SEGMENT_MESSAGES,
+      minMessages: threadQualifies ? 1 : Number.POSITIVE_INFINITY,
     };
   }
   const allSegments = splitIntoSegments(messages, segmentOpts);
@@ -1517,20 +1380,20 @@ async function processPage(
         const canonical = state.canonicalizer.canonicalize(fact.entity_slug);
         if (canonical !== fact.entity_slug) state.result.entity_slugs_canonicalized++;
         return {
-        ...fact,
-        entity_slug: canonical,
-        row_num: rowNum + i,
-        source_markdown_slug: page.slug,
-        source: PER_SEGMENT_SOURCE_PREFIX,
-        source_session: sessionId,
-        // Preserve the conversation's valid time instead of defaulting every
-        // extracted fact to extraction time. Epoch-anchored parses have no
-        // trustworthy date, so they retain the existing now() fallback.
-        ...(seg.startIso && !seg.startIso.startsWith('1970-')
-          ? { valid_from: new Date(seg.startIso) }
-          : {}),
-        context:
-          fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
+          ...fact,
+          entity_slug: canonical,
+          row_num: rowNum + i,
+          source_markdown_slug: page.slug,
+          source: PER_SEGMENT_SOURCE_PREFIX,
+          source_session: sessionId,
+          // Preserve the conversation's valid time instead of defaulting every
+          // extracted fact to extraction time. Epoch-anchored parses have no
+          // trustworthy date, so they retain the existing now() fallback.
+          ...(seg.startIso && !seg.startIso.startsWith('1970-')
+            ? { valid_from: new Date(seg.startIso) }
+            : {}),
+          context:
+            fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
         };
       });
       const ins = await state.engine.insertFacts(rows, { source_id: state.sourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
@@ -1672,7 +1535,7 @@ export async function runExtractConversationFactsCore(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
-    pages_skipped_single_inbound_email: 0,
+    pages_skipped_out_of_scope_email: 0,
     email_messages_dropped_automated: 0,
     entity_slugs_canonicalized: 0,
     pages_skipped_unrecognized_speaker: 0,
@@ -1733,11 +1596,21 @@ export async function runExtractConversationFactsCore(
   const llmFallbackModel = llmFallbackEnabled
     ? await resolveModel(engine, {
         tier: 'utility',
-        fallback: 'anthropic:claude-haiku-4-5-20251001',
+        // #3813: last-resort fallback stays key-aware, never hardcoded Anthropic.
+        fallback: resolveTierDefault('utility'),
       })
     : null;
 
+  // The model gate runs here too (not only in the CLI), so a background job
+  // or a direct core caller with a bad id fails before any page is claimed.
+  if (opts.model && !dryRun) {
+    const problem = validateModelFlag(opts.model);
+    if (problem) throw new Error(problem);
+  }
   const canonicalizer = await EntitySlugCanonicalizer.load(engine, sourceId);
+  const emailDenylist = opts.emailAutomatedSenders
+    ? compileEmailSenderDenylist(opts.emailAutomatedSenders)
+    : await loadEmailSenderDenylist(engine);
   const state: ExtractCoreState = {
     result,
     engine,
@@ -1752,6 +1625,7 @@ export async function runExtractConversationFactsCore(
     llmFallbackModel,
     model: opts.model ?? null,
     canonicalizer,
+    emailDenylist,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
@@ -1845,6 +1719,10 @@ export async function runExtractConversationFactsCore(
           result.pages_skipped++;
           continue;
         }
+        if (isOutOfScopeEmail(page)) {
+          result.pages_skipped_out_of_scope_email++;
+          continue;
+        }
         await processPageWithLock(page);
       }
     } else if (opts.slug) {
@@ -1857,6 +1735,12 @@ export async function runExtractConversationFactsCore(
         result.pages_skipped++;
         return;
       }
+      // Same scope rule as enumeration: a digest or a single inbound message
+      // named explicitly is skipped without a lock or an audit row.
+      if (isOutOfScopeEmail(page)) {
+        result.pages_skipped_out_of_scope_email++;
+        return;
+      }
 
       await processPageWithLock(page);
     } else {
@@ -1864,7 +1748,7 @@ export async function runExtractConversationFactsCore(
       // each type with keyset pagination, filters, and feeds the pool lazily.
       // No per-batch barrier: a worker that finishes a short page pulls the
       // next candidate while its siblings are still on long threads.
-      const candidateBatch = Math.max(PAGE_LIST_BATCH, workers * 2);
+      const candidateBatch = Math.min(MAX_CANDIDATE_BATCH, Math.max(PAGE_LIST_BATCH, workers * 2));
       let yielded = 0;
       const claimablePages = async function* (): AsyncGenerator<Page> {
         // Filter one accumulated candidate set: one durable-outcome query per
@@ -1895,14 +1779,16 @@ export async function runExtractConversationFactsCore(
             });
             if (batch.length > 0) {
               const last = batch[batch.length - 1];
-              keyset = { updatedAt: new Date(last.updated_at).toISOString(), slug: last.slug };
+              // Column-precision cursor (see Page.updated_at_iso): a millisecond
+              // Date would re-select every row in the last row's millisecond.
+              keyset = { updatedAt: last.updated_at_iso ?? new Date(last.updated_at).toISOString(), slug: last.slug };
             }
             exhausted = batch.length < PAGE_LIST_BATCH;
             // Email: digest pages and single inbound messages are out of scope.
             // Skip them before the durable lookup, so they cost one list read
             // and no audit row.
             for (const page of batch) {
-              if (isOutOfScopeEmail(page)) state.result.pages_skipped_single_inbound_email++;
+              if (isOutOfScopeEmail(page)) state.result.pages_skipped_out_of_scope_email++;
               else candidates.push(page);
             }
             if (candidates.length < candidateBatch && !exhausted) continue;
@@ -2151,6 +2037,9 @@ function parseArgs(args: string[]): ParsedArgs {
     if (a === '--dry-run') { out.dryRun = true; continue; }
     if (a === '--force') { out.force = true; continue; }
     if (a === '--yes' || a === '-y') { out.yes = true; continue; }
+    // --background / --follow belong to the dispatcher (maybeBackground); the
+    // pre-parse that gates --model before enqueueing must not choke on them.
+    if (a === '--background' || a === '--follow') { continue; }
     if (a === '--override-disabled') { out.overrideDisabled = true; continue; }
     if (a === '--slug') { out.slug = args[++i]; continue; }
     if (a === '--model') { out.model = args[++i]; continue; }
@@ -2228,7 +2117,8 @@ Options:
   --model <id>           Extractor chat model for this run (e.g. openai:gpt-5.6-sol).
                          Default: facts.extraction_model, else the reasoning tier.
   --dry-run              Show segmentation + counts; no DB writes, no checkpoint advance.
-  --limit <N>            Cap pages processed (default: all).
+  --limit <N>            Cap pages processed: the N oldest-updated claimable pages
+                         (enumeration walks updated_at ascending; default: all).
   --since <iso>          Only consider messages newer than this ISO timestamp.
   --force                Re-process the target page (clears its resume entry).
   --sleep <ms>           Delay between extractor calls (default ${DEFAULT_INTER_CALL_SLEEP_MS}).
@@ -2291,6 +2181,20 @@ export async function runExtractConversationFacts(
     return;
   }
 
+  // --model must be servable before any page is claimed, and before the run
+  // is handed to the job queue: an unknown id would otherwise fail every
+  // segment with chat_unavailable / no_pricing after a lock + snapshot.
+  // parseArgs is pure, so this pre-parse costs nothing; argument errors are
+  // reported by the full parse below.
+  const pre = parseArgs(args);
+  if (!pre.error && pre.model && !pre.dryRun) {
+    const problem = validateModelFlag(pre.model);
+    if (problem) {
+      console.error(problem);
+      process.exit(1);
+    }
+  }
+
   // --background path.
   const backgrounded = await maybeBackground({
     engine,
@@ -2320,25 +2224,6 @@ export async function runExtractConversationFacts(
     );
     process.exit(1);
   }
-  // --model must be servable before any page is claimed: an unknown id would
-  // otherwise fail every segment with chat_unavailable after a lock + snapshot.
-  if (parsed.model && !parsed.dryRun && !isAvailable('chat', parsed.model)) {
-    console.error(
-      `--model ${parsed.model} is not servable by the chat gateway (unknown provider, or its key is missing). ` +
-      'Use the provider:model form, e.g. openai:gpt-5.6-sol.',
-    );
-    process.exit(1);
-  }
-  // isAvailable only proves the provider key; the model id itself is checked
-  // against the pricing table, because a run always carries a cost cap and
-  // BudgetTracker hard-fails reserve() with no_pricing for an unpriced id.
-  if (parsed.model && !parsed.dryRun && !canonicalLookup(parsed.model)) {
-    console.error(
-      `--model ${parsed.model} has no pricing entry (src/core/model-pricing.ts), so the --max-cost-usd cap cannot gate it ` +
-      'and every segment would fail with no_pricing. Use a priced id (e.g. openai:gpt-5.6-sol) or add the entry first.',
-    );
-    process.exit(1);
-  }
   // Aggregate result across all sources.
   const aggregate: ExtractConversationFactsResult = {
     pages_considered: 0,
@@ -2349,7 +2234,7 @@ export async function runExtractConversationFacts(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
-    pages_skipped_single_inbound_email: 0,
+    pages_skipped_out_of_scope_email: 0,
     email_messages_dropped_automated: 0,
     entity_slugs_canonicalized: 0,
     pages_skipped_unrecognized_speaker: 0,
@@ -2401,7 +2286,7 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped_completed += perSource.pages_skipped_completed;
       aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
-      aggregate.pages_skipped_single_inbound_email += perSource.pages_skipped_single_inbound_email;
+      aggregate.pages_skipped_out_of_scope_email += perSource.pages_skipped_out_of_scope_email;
       aggregate.email_messages_dropped_automated += perSource.email_messages_dropped_automated;
       aggregate.entity_slugs_canonicalized += perSource.entity_slugs_canonicalized;
       aggregate.pages_skipped_unrecognized_speaker += perSource.pages_skipped_unrecognized_speaker;
@@ -2452,8 +2337,8 @@ export async function runExtractConversationFacts(
   if (aggregate.pages_marked_non_extractable > 0) {
     console.log(`  Marked ${aggregate.pages_marked_non_extractable} page(s) as scanned, not extractable.`);
   }
-  if (aggregate.pages_skipped_single_inbound_email > 0) {
-    console.log(`  Skipped ${aggregate.pages_skipped_single_inbound_email} out-of-scope email page(s) (single inbound message or digest; not audited).`);
+  if (aggregate.pages_skipped_out_of_scope_email > 0) {
+    console.log(`  Skipped ${aggregate.pages_skipped_out_of_scope_email} out-of-scope email page(s) (single inbound message or digest; not audited).`);
   }
   if (aggregate.email_messages_dropped_automated > 0) {
     console.log(`  Dropped ${aggregate.email_messages_dropped_automated} email message(s) from automated senders before segmenting.`);

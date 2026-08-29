@@ -123,6 +123,9 @@ const GATEWAY_REFRESH_JOB_NAMES = new Set([
   // refresh a worker booted before `config set` never saw the DB-plane chat
   // model and every extraction silently returned no_events.
   'chronicle_extract',
+  // Open-loop commitment extraction (google source kind): same judge shape
+  // as chronicle_extract, same stale-gateway failure class.
+  'loops_extract',
 ]);
 
 function registerBuiltinJob(
@@ -2273,7 +2276,7 @@ export async function registerBuiltinHandlers(
   // the core level and returned as `result.budget_exhausted: true` (NOT
   // a job failure) so the user can resume with a higher cap.
   registerBuiltinJob(worker, engine, 'extract-conversation-facts', async (job) => {
-    const { runExtractConversationFactsCore } = await import('./extract-conversation-facts.ts');
+    const { runExtractConversationFactsCore, validateModelFlag } = await import('./extract-conversation-facts.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
     if (!sourceId) {
       // Multi-source iteration not supported in the Minion-handler path;
@@ -2288,6 +2291,14 @@ export async function registerBuiltinHandlers(
           (t): t is AllowedType => (ALLOWED_TYPES as readonly string[]).includes(t),
         )
       : undefined;
+    // The CLI gates --model before enqueueing; a job submitted through the
+    // API carries whatever the submitter sent, so gate it here as well
+    // before any page is claimed.
+    const model = typeof job.data.model === 'string' ? job.data.model : undefined;
+    if (model && !job.data.dryRun) {
+      const problem = validateModelFlag(model);
+      if (problem) throw new Error(problem);
+    }
     const result = await runExtractConversationFactsCore(engine, {
       sourceId,
       types,
@@ -2305,7 +2316,7 @@ export async function registerBuiltinHandlers(
       // works end-to-end.
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
       // Round-trip --model the same way; buildJobParams sends it.
-      model: typeof job.data.model === 'string' ? job.data.model : undefined,
+      model,
     });
     return result;
   });
@@ -2330,6 +2341,19 @@ export async function registerBuiltinHandlers(
       tz,
       signal: (job as { signal?: AbortSignal }).signal,
     });
+  });
+
+  // Open-loop commitment/decision extraction over google-source email pages
+  // (src/core/google/loops-extract.ts). Enqueued by runGoogleSync on trickle
+  // threads within the recent window, idempotency-keyed per page revision,
+  // capped per sweep. Kill switch: config loops.extraction_enabled.
+  registerBuiltinJob(worker, engine, 'loops_extract', async (job) => {
+    const slug = typeof job.data.slug === 'string' ? job.data.slug : undefined;
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    if (!slug || !sourceId) throw new Error('loops_extract job requires data.slug and data.sourceId');
+    const threadId = typeof job.data.threadId === 'string' ? job.data.threadId : undefined;
+    const { runLoopsExtract } = await import('../core/google/loops-extract.ts');
+    return await runLoopsExtract(engine, { slug, sourceId, ...(threadId ? { threadId } : {}) });
   });
 
   // v0.41.39 (#1700) — enrich. NOT in PROTECTED_JOB_NAMES: per-call cost is
