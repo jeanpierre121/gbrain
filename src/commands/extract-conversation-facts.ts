@@ -107,7 +107,7 @@ import {
   type ExtractedFact,
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
-import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
+import { BudgetTracker, BudgetExhausted, loadPricingOverrides } from '../core/budget/budget-tracker.ts';
 import {
   EMAIL_SEGMENT_GAP_MINUTES,
   DEFAULT_SEGMENT_MAX_CHARS,
@@ -1852,6 +1852,7 @@ export async function runExtractConversationFactsCore(
       const tracker = new BudgetTracker({
         maxCostUsd: opts.maxCostUsd ?? DEFAULT_MAX_COST_USD,
         label: `extract-conversation-facts:${sourceId}`,
+        pricingOverrides: await loadPricingOverrides(engine),
       });
       ownedTracker = tracker;
       try {
