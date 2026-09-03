@@ -1,5 +1,16 @@
 # TODOS
 
+## Brain-plane repair follow-ups (filed on fork run/full-facts, 2026-09-03)
+
+Context: the containerized maintenance plane (Modal) was repaired 2026-09-02/03; plan of record `~/brain-plane-repair-plan-2026-09-02.md` (private). Upstream carve: PR #4805 (brain-dir resolver, GBRAIN_LOCK_HOST, cap gate, inline-queue liveness, synth-v2 completion skip).
+
+- [ ] **P2 — link manifest cost on large brains.** `link-manifest.ts` runs up to 12 entity + 8 segment keyword searches per transcript (~50 s each child on an 81k-page brain). Cap the queries, batch them, or reuse the triage entities' basename index only. Until then the nightly cap of 8 bounds it.
+- [ ] **P2 — synthesize renews the children's private-queue lease during its submit loop.** Today the lease (10 min) is renewed only from the wait loop after the inline drain; the classifier now treats the queue as live while a cycle lock is fresh (f08e6746b), but renewing the lease is the honest fix.
+- [ ] **P3 — inline drain concurrent with submission.** Start `runSubagentsInline` after the first child instead of after the whole loop so a slow submit loop never delays the first page by minutes.
+- [ ] **P3 — retrofit path for existing dream pages.** Coalesced children used to re-enter `writtenRefs` and quote-repair old pages every night (487 pages on 2026-09-03); 825a8e0a0 skips them. If a retrofit is wanted, make it an explicit command (`gbrain dream verify --recheck`, see E9 below) rather than a side effect.
+- [ ] **P3 — `sync.write_through` env override.** The plane runs DB-only (`sync.write_through=false` brain-wide, decided 2026-09-03). A `GBRAIN_SYNC_WRITE_THROUGH` env override would let a containerized worker be DB-only while a laptop keeps its mirror.
+- [ ] **P3 — `modal run` of the app module fires the module's schedules a second time.** Observed duplicate lane rows at :00/:30 while a hand `modal run modal_app.py::fn` was alive; the plane now dedupes with per-slot idempotency keys. Prefer `scripts/*.py` ephemeral apps for hand runs.
+
 ## whoami stdio-fix follow-ups (filed on fork run/full-facts, 2026-08-06)
 
 - [x] **P2 — `FactReaderTrust` trust polarity contradicts the repo-wide fail-closed
