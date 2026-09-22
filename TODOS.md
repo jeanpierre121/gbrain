@@ -9545,3 +9545,4 @@ covers DEAD logs; go-forward capture beyond Claude Code is deliberately absent.
   ChatGPT/Claude harness. Injected platform tests and SDK/HTTP tests do not prove
   those native integrations. Live provider checks require separate consent and
   configured credentials.
+- extract-conversation-facts (email): since the v0.50.5.0 merge, a bare name the resolver cannot place on a page stays UNPARENTED (upstream rule) instead of minting a raw slug; prefixed people/ and companies/ slugs and folds onto a known sibling stay parented through the `foldFallback` seam in `resolve-on-save.ts`. Re-check the fold hit rate on the live brain when the facts lane comes back (October 2026 revisit).
