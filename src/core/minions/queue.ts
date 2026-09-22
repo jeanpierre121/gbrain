@@ -1009,8 +1009,13 @@ export class MinionQueue {
          max(q.private_queue_lease_until)::text AS max_lease_until,
          count(*) FILTER (WHERE q.private_queue_lease_until > now()) AS future_lease_rows,
          count(*) FILTER (WHERE q.updated_at > now() - interval '120 seconds') AS recently_touched,
-         (SELECT count(*) FROM gbrain_cycle_locks
-           WHERE last_refreshed_at > now() - interval '5 minutes') AS live_cycle_locks
+         (SELECT count(*) FROM gbrain_cycle_locks l
+           WHERE l.last_refreshed_at > now() - interval '5 minutes'
+             AND l.id LIKE 'gbrain-cycle%'
+             AND l.acquired_at <= (SELECT min(created_at) FROM q) + interval '60 seconds'
+             AND (l.id = 'gbrain-cycle'
+                  OR (SELECT min(data->>'source_id') FROM q) IS NULL
+                  OR l.id = 'gbrain-cycle:' || (SELECT min(data->>'source_id') FROM q))) AS live_cycle_locks
        FROM q`,
       [queueName],
     );
@@ -1022,13 +1027,17 @@ export class MinionQueue {
     }
     // A dream-inline queue belongs to a cycle, and a cycle holds a cycle lock
     // that its refresher renews every ~50 s (cycle.ts LOCK_TTL_MS, 5 min).
-    // While any cycle lock is fresh, treat the queue as live even when its
-    // owner-less children carry a lapsed lease: a CLI `gbrain dream` renews
-    // the lease only once it reaches its inline drain, and its submit loop
-    // can outlast the lease, so a worker starting in between (a 15-minute
-    // drain tick on a containerized plane) reaped live children
-    // (2026-09-03). A crashed cycle stops refreshing and the queue becomes
-    // reapable again 5 minutes later, which is the intended backstop.
+    // While a cycle lock that could OWN the queue is fresh, treat the queue
+    // as live even when its owner-less children carry a lapsed lease: a CLI
+    // `gbrain dream` renews the lease only once it reaches its inline drain,
+    // and its submit loop can outlast the lease, so a worker starting in
+    // between (a 15-minute drain tick on a containerized plane) reaped live
+    // children (2026-09-03). Ownership follows the doctor's #4250 rule: the
+    // lock was acquired at/before the queue's oldest row (60 s clock skew)
+    // and is the bare global lock or the queue's own source lock; a queue
+    // with no recorded source is possibly owned by any such lock (fail-safe:
+    // the reaper cancels jobs). A crashed cycle stops refreshing and the
+    // queue becomes reapable again 5 minutes later, the intended backstop.
     if (Number(r.live_cycle_locks ?? 0) > 0) return 'live';
     if (Number(r.metadata_rows ?? 0) === 0) return 'unowned';
     // Freshness guard BEFORE the owner-terminal fast path: any row touched in
