@@ -3,7 +3,7 @@ import { join, relative, extname, basename, dirname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
 import type { StorageBackend, StorageConfig } from '../core/storage.ts';
-import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
+import { sqlQueryForEngine, executeRawJsonb, FILES_METADATA_MERGE_SQL } from '../core/sql-query.ts';
 import { humanSize } from '../core/file-resolver.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -182,7 +182,7 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
   // Precondition first: a backend-less upload can only produce a phantom row
   // (metadata for bytes that were never stored), so refuse before touching the
   // DB or reporting anything as uploaded.
-  const { storage } = await requireStorageBackend('upload');
+  const { storage, storageConfig } = await requireStorageBackend('upload');
 
   const stat = statSync(filePath);
   const hash = fileHash(filePath);
@@ -207,6 +207,9 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
 
   // files.metadata is JSONB — bind a real object via executeRawJsonb instead
   // of casting a string into ::jsonb (the #2339 double-encode class).
+  // #4910: stamp the lane so readers (doctor image_assets, files verify)
+  // know storage_path is a bucket key; the upsert merges metadata so a
+  // legacy `{}` row heals on its next content change.
   await executeRawJsonb(
     engine,
     `INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
@@ -214,9 +217,10 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
      ON CONFLICT (storage_path) DO UPDATE SET
        content_hash = EXCLUDED.content_hash,
        size_bytes = EXCLUDED.size_bytes,
-       mime_type = EXCLUDED.mime_type`,
+       mime_type = EXCLUDED.mime_type,
+       ${FILES_METADATA_MERGE_SQL}`,
     [pageSlug, filename, storagePath, mimeType, stat.size, hash],
-    [{}],
+    [{ storage: storageConfig.backend }],
   );
 
   console.log(`Uploaded: ${storagePath} (${humanSize(stat.size)})`);
@@ -244,6 +248,19 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
 
   const stat = statSync(filePath);
   const filename = basename(filePath);
+  // A file argument that IS `.` or `..` makes basename() return that
+  // literal string back rather than a real leaf filename (a trailing
+  // separator, e.g. `foo/`, is stripped by basename() to `foo` — not
+  // affected). The git-storage branch below joins this value onto its
+  // sidecar dest dir (`destDir/${filename}`) — a `..` segment there walks
+  // the join back up OUT of the intended `.raw/<page>/` dir before the
+  // copy. Reject early with a clear error instead of letting it silently
+  // resolve to the parent dir and fail deep inside copyFileSync with a
+  // confusing OS-level error.
+  if (filename === '.' || filename === '..') {
+    console.error(`files upload-raw: "${filePath}" does not name a real file (resolves to "${filename}").`);
+    process.exit(1);
+  }
   const mimeType = getMimeType(filePath);
   const isMedia = mimeType?.startsWith('video/') || mimeType?.startsWith('audio/') || mimeType?.startsWith('image/');
   const needsCloud = stat.size >= SIZE_THRESHOLD || isMedia;
@@ -293,9 +310,10 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
        ON CONFLICT (storage_path) DO UPDATE SET
          content_hash = EXCLUDED.content_hash,
          size_bytes = EXCLUDED.size_bytes,
-         mime_type = EXCLUDED.mime_type`,
+         mime_type = EXCLUDED.mime_type,
+         ${FILES_METADATA_MERGE_SQL}`,
       [sourceId, pageSlug, filename, storagePath, mimeType, stat.size, 'sha256:' + hash],
-      [{ storage: 'git', type: fileType }],
+      [{ storage: 'git', ...(fileType ? { type: fileType } : {}) }],
     );
     console.log(JSON.stringify({
       success: true,
@@ -360,9 +378,10 @@ async function uploadRaw(engine: BrainEngine, args: string[]) {
      ON CONFLICT (storage_path) DO UPDATE SET
        content_hash = EXCLUDED.content_hash,
        size_bytes = EXCLUDED.size_bytes,
-       mime_type = EXCLUDED.mime_type`,
+       mime_type = EXCLUDED.mime_type,
+       ${FILES_METADATA_MERGE_SQL}`,
     [pageSlug, filename, storagePath, mimeType, stat.size, 'sha256:' + hash],
-    [{ type: fileType, upload_method: method }],
+    [{ storage: (config.storage as StorageConfig).backend, ...(fileType ? { type: fileType } : {}), upload_method: method }],
   );
 
   // Output JSON for scripting
@@ -410,7 +429,7 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
   // Pre-fix this command inserted a `files` row per file and reported them as
   // "uploaded" without ever calling the storage backend — every row it produced
   // was a phantom, even on a brain WITH storage configured.
-  const { storage } = await requireStorageBackend('sync');
+  const { storage, storageConfig } = await requireStorageBackend('sync');
 
   const files = collectFiles(dir);
   console.log(`Found ${files.length} files to sync`);
@@ -456,9 +475,10 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
        ON CONFLICT (storage_path) DO UPDATE SET
          content_hash = EXCLUDED.content_hash,
          size_bytes = EXCLUDED.size_bytes,
-         mime_type = EXCLUDED.mime_type`,
+         mime_type = EXCLUDED.mime_type,
+         ${FILES_METADATA_MERGE_SQL}`,
       [pageSlug, filename, storagePath, mimeType, stat.size, hash],
-      [{}],
+      [{ storage: storageConfig.backend }],
     );
 
     uploaded++;

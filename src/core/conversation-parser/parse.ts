@@ -430,10 +430,13 @@ export function applyPattern(
     if (m) {
       let iso = buildIso(m, entry, runningCtx);
       if (iso === null) {
-        // Reconstruction failed. Dropping the anchor would fold this
-        // message's body into the PREVIOUS speaker (silent misattribution),
-        // so open the message on the page's fallback date and count it.
-        iso = `${runningCtx.fallbackDate}T00:00:00Z`;
+        // Reconstruction failed (e.g. a localized month name). Dropping the
+        // anchor would fold this message's body into the PREVIOUS speaker
+        // (silent misattribution, phase still regex_match), so open the
+        // message anyway and count it. Inherit the previous anchor's
+        // timestamp so ordering and downstream segment continuity survive;
+        // midnight of the page date only when this is the first anchor.
+        iso = out[out.length - 1]?.timestamp ?? `${runningCtx.fallbackDate}T00:00:00Z`;
         if (diag) diag.date_fallback_count = (diag.date_fallback_count ?? 0) + 1;
       }
       const rawSpeaker = m[entry.captures.speaker_group] ?? '';
@@ -758,6 +761,7 @@ function finishRegexMatch(
     matched_pattern_id: entry.id,
     patterns_scored: patternsScored,
     timezone_warning,
+    // Anchors rescued onto a fallback timestamp; undefined when zero.
     date_fallback_count: diag.date_fallback_count || undefined,
     // #4136 — populated unconditionally (NOT behind opts.diagnostic): the
     // extractor's decline gate depends on it. Undefined when empty.

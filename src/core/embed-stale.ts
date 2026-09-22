@@ -22,7 +22,7 @@ import type { Chunk, ChunkInput } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
 import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
-import { invalidateStaleSignatureEmbeddingsGuarded } from './embedding-invalidation.ts';
+import { invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
   quoteIdentifier,
@@ -136,6 +136,57 @@ export interface EmbedStaleResult {
   done: boolean;
   /** True iff the loop exited because `signal.aborted` fired. */
   aborted: boolean;
+}
+
+/** Per-drain stamp context: the signature plus the registry-active column
+ *  it is judged against. Resolved ONCE per drain by `resolveProvenanceStamp`
+ *  — resolving inside the stamp helper cost a config round-trip per stamped
+ *  page per batch, from both keyset drains. */
+export interface ProvenanceStamp { signature: string; column: string }
+
+/** Undefined when no signature is known (gateway unconfigured): nothing to stamp. */
+export async function resolveProvenanceStamp(
+  engine: BrainEngine,
+  signature: string | undefined,
+): Promise<ProvenanceStamp | undefined> {
+  if (!signature) return undefined;
+  const column = (await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name;
+  return { signature, column };
+}
+
+/**
+ * Stamp `pages.embedding_signature` once EVERY chunk on the page carries an
+ * active-column vector written by the signature's model against the CURRENT
+ * chunk_text (`embedded_text_hash = md5(chunk_text)`) at the signature's vector
+ * width. Judged from DB state,
+ * not from the caller's batch: `listStaleChunks` pages by ROW with no page
+ * alignment, so a page straddling a batch boundary is never wholly in one
+ * batch — the batch that lands its last chunk stamps it here. A partially
+ * stale page whose preserved chunks carry another model (or a NULL model or
+ * hash) stays unstamped. Both keyset drains (`embed --stale` and the minion
+ * `embed-backfill` handler via `embedStaleForSource`) route through this.
+ * Returns whether the stamp landed.
+ */
+export async function stampIfPageProvenanceComplete(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  { signature, column }: ProvenanceStamp,
+): Promise<boolean> {
+  // Signature is `<provider:model>:<dims>`; the model part is what
+  // upsertChunks records in content_chunks.model.
+  const { model, dims } = splitEmbeddingSignature(signature);
+  const colId = quoteIdentifier(column);
+  const rows = await engine.executeRaw<{ complete: boolean }>(
+    `SELECT count(*) > 0
+            AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}) AS complete
+       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+      WHERE p.slug = $2 AND p.source_id = $3`,
+    [model, slug, sourceId, dims],
+  );
+  if (rows[0]?.complete !== true) return false;
+  await engine.setPageEmbeddingSignature(slug, { sourceId, signature });
+  return true;
 }
 
 /** Probe input for `probeEmbedder`. Exported so tests can detect probe calls. */
@@ -304,6 +355,7 @@ export async function embedStaleForSource(
     aborted: false,
   };
   const signature = opts.embeddingSignature;
+  const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
 
   // v0.41.31: invalidate embeddings stamped under a prior model signature so
   // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
@@ -431,13 +483,13 @@ export async function embedStaleForSource(
           token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
         }));
         await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-        // v0.41.31: stamp provenance only when EVERY chunk was stale (fully
-        // re-embedded this pass) — a partially-stale page keeps preserved
-        // chunks of unknown provenance, so don't claim current. After the
-        // invalidate pass above, signature-drifted pages ARE fully stale.
-        if (signature && stale.length === existing.length) {
+        // Stamp provenance from DB state, not this batch (#4825): the keyset
+        // drain has no page alignment, so a page straddling a batch boundary
+        // is never wholly in one batch — the batch that lands its last chunk
+        // stamps it. Preserved chunks of other provenance keep it unstamped.
+        if (stamp) {
           await observed(pacer, () =>
-            engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+            stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp),
           );
         }
         // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the

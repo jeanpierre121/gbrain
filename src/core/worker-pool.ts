@@ -60,7 +60,7 @@
  * The helper checks `err.tag` against `MUST_ABORT_ERROR_TAGS` BEFORE
  * dispatching to onError. Matched errors: set aborted=true, call
  * AbortController.abort() (propagates to in-flight onItem via
- * `signal`), rethrow. This makes "cap is a hard ceiling" a structural
+ * `signal`), join the remaining workers, rethrow. This makes "cap is a hard ceiling" a structural
  * property of the helper, not a per-caller convention.
  *
  * Future tagged classes (UnrecoverableError, etc.) add their tag to

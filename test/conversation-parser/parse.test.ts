@@ -1452,7 +1452,7 @@ describe('email-thread-heading — date edge cases (2026-08-28 review)', () => {
     expect(r.messages[1].text).toBe('bob body');
   });
 
-  test('an unparseable date opens a fallback-dated message instead of folding into the previous speaker', () => {
+  test('an unparseable date opens its own message on the previous anchor\'s timestamp instead of folding into the previous speaker', () => {
     const r = parseConversation(
       [
         '## Alice &lt;a@x.com&gt; — Mon, 01 Jun 2026 09:00:00 +0000 (received)',
@@ -1466,7 +1466,10 @@ describe('email-thread-heading — date edge cases (2026-08-28 review)', () => {
     expect(r.messages[0].text).toBe('alice body');
     expect(r.messages[1].speaker).toContain('Bob');
     expect(r.messages[1].text).toBe('bob body');
-    expect(r.messages[1].timestamp).toBe('2026-05-30T00:00:00Z');
+    // Upstream #4681 narrow cut: a rescued anchor inherits the previous
+    // anchor's timestamp (midnight of the page date only for a FIRST anchor).
+    expect(r.messages[1].timestamp).toBe('2026-06-01T09:00:00.000Z');
+    expect(r.messages[1].timestamp).toBe(r.messages[0].timestamp);
     expect(r.date_fallback_count).toBe(1);
   });
 
@@ -1478,11 +1481,17 @@ describe('email-thread-heading — date edge cases (2026-08-28 review)', () => {
   });
 });
 
-describe('date-fallback anchoring applies to every pattern, not only email', () => {
+// Date-fallback anchoring (#4681 narrow cut): an anchor whose date cannot be
+// reconstructed still opens its own message instead of being dropped and
+// folding its body into the previous speaker.
+// ---------------------------------------------------------------------------
+
+describe('date-fallback anchoring applies to every pattern (#4681)', () => {
   test('a telegram anchor with an unknown month opens a fallback-dated message instead of folding', () => {
-    // Before the fallback, buildIso() returning null dropped the anchor and
-    // the body folded into the previous speaker. Pin the new behavior on a
-    // non-email pattern that reaches the scoring path.
+    // buildIso() returning null used to drop the anchor; on a multi_line
+    // pattern the body then folded into the PREVIOUS speaker while the parse
+    // still returned regex_match (silent misattribution). Reachable on
+    // telegram-text-export with any non-English 3-letter month.
     const body = [
       'Alice Doe, [Mar 15, 2024 at 6:37:00 PM]',
       'hello',
@@ -1497,10 +1506,36 @@ describe('date-fallback anchoring applies to every pattern, not only email', () 
     expect(r.messages[0].text).toBe('hello');
     expect(r.messages[1].speaker).toContain('Bob');
     expect(r.messages[1].text).toBe('bad month');
-    expect(r.messages[1].timestamp).toBe('2024-03-15T00:00:00Z');
-    expect(r.messages[1].direction).toBeUndefined();
+    // Inherits the previous anchor's timestamp (NOT midnight): a midnight
+    // stamp mid-page would open a new too-short segment downstream in
+    // extract-conversation-facts and lose the following message.
+    expect(r.messages[1].timestamp).toBe('2024-03-15T18:37:00Z');
     expect(r.messages[2].text).toBe('bye');
     expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('a first-anchor date failure anchors at midnight of the page fallback date', () => {
+    const body = [
+      'Bob Roe, [Xyz 15, 2024 at 6:38:00 PM]',
+      'bad month',
+      'Alice Doe, [Mar 15, 2024 at 6:39:00 PM]',
+      'bye',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.matched_pattern_id).toBe('telegram-text-export');
+    expect(r.messages).toHaveLength(2);
+    expect(r.messages[0].speaker).toContain('Bob');
+    expect(r.messages[0].text).toBe('bad month');
+    expect(r.messages[0].timestamp).toBe('2024-03-15T00:00:00Z');
+    expect(r.date_fallback_count).toBe(1);
+  });
+
+  test('healthy pages carry no date_fallback_count (JSON stays byte-identical)', () => {
+    const body = ['Alice Doe, [Mar 15, 2024 at 6:37:00 PM]', 'hello', 'Bob Roe, [Mar 15, 2024 at 6:38:00 PM]', 'hi'].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2024-03-15' });
+    expect(r.messages).toHaveLength(2);
+    expect(r.date_fallback_count).toBeUndefined();
+    expect('date_fallback_count' in JSON.parse(JSON.stringify(r))).toBe(false);
   });
 });
 

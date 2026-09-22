@@ -1,5 +1,5 @@
 import type {
-  Page, PageInput, PageFilters, GetPageOpts,
+  Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
   SearchResult, SearchOpts, ResolvedColumn,
   Link, GraphNode, GraphPath, RelationalFanoutRow, RelationalFanoutOpts,
@@ -61,7 +61,7 @@ export interface SourceRow {
   config: Record<string, unknown>;
 }
 
-export interface TraverseGraphOpts {
+export interface TraverseGraphOpts extends PageReadScope {
   sourceId?: string;
   sourceIds?: string[];
   frontierCap?: number;
@@ -295,7 +295,7 @@ export interface Take {
   updated_at: string;
 }
 
-export interface TakesListOpts {
+export interface TakesListOpts extends PageReadPolicy {
   page_id?: number;
   page_slug?: string;       // resolved via JOIN
   holder?: string;
@@ -399,7 +399,7 @@ export interface TakesScorecard {
   unresolvable_rate?: number | null;
 }
 
-export interface TakesScorecardOpts {
+export interface TakesScorecardOpts extends PageReadScope {
   holder?: string;
   domainPrefix?: string; // e.g. 'companies/' to scope the scorecard
   since?: string;        // ISO date 'YYYY-MM-DD'
@@ -423,7 +423,7 @@ export interface CalibrationBucket {
   predicted: number | null;
 }
 
-export interface CalibrationCurveOpts {
+export interface CalibrationCurveOpts extends PageReadScope {
   holder?: string;
   bucketSize?: number; // default 0.1
   /** Federated/source scope via the take's page.source_id (array wins over scalar). */
@@ -631,10 +631,10 @@ export interface FactListOpts {
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
 export interface FactsHealth {
   source_id: string;
-  total_active: number;          // facts where expired_at IS NULL
+  total_active: number;          // expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())
   total_today: number;           // created in last 24h
   total_week: number;            // created in last 7d
-  total_expired: number;         // expired_at IS NOT NULL
+  total_expired: number;         // expired_at IS NOT NULL OR valid_until <= now() (the complement of active)
   total_consolidated: number;    // consolidated_at IS NOT NULL
   top_entities: Array<{ entity_slug: string; count: number }>;
   /** Optional counters fed by the queue / classifier — populated when those modules report. */
@@ -968,7 +968,7 @@ export interface BrainEngine {
    * `gbrain query --resolve` CLI path, etc.). Field names match the
    * `sourceScopeOpts(ctx)` helper output so callers can spread directly.
    */
-  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]>;
+  resolveSlugs(partial: string, opts?: PageReadScope): Promise<string[]>;
   /**
    * Returns the slug of every page in the brain. Used by batch commands as a
    * mutation-immune iteration source (alternative to listPages OFFSET pagination,
@@ -1141,7 +1141,7 @@ export interface BrainEngine {
    * them away). `includeEmbedding` opts back in, and beats
    * `getChunksWithEmbeddings`, which honors neither scope precedence nor RLS.
    */
-  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: PageReadScope & { includeEmbedding?: boolean }): Promise<Chunk[]>;
   /**
    * Count chunks whose registry-ACTIVE embedding column IS NULL (S2).
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
@@ -1430,13 +1430,13 @@ export interface BrainEngine {
    * grant); the scalar branch is internal/CLI and keeps cross-source visibility
    * (reconcileLinks + back-link validators depend on it).
    */
-  getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getLinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
   /**
    * v0.31.8 (D12 + D16): same `opts.sourceId` semantics as `getLinks`,
    * applied to the to-page side of the join. #2200: `opts.sourceIds` federated
    * grant constrains both endpoints (see `getLinks`).
    */
-  getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getBacklinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
   /**
    * v114 (#1941): distinct link_source provenances with edge counts, for
    * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both
@@ -1499,8 +1499,22 @@ export interface BrainEngine {
    */
   traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+    opts?: PageReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
   ): Promise<GraphPath[]>;
+  /**
+   * `traversePaths` plus its truncation signal. The final SELECT is bounded
+   * by `TRAVERSE_PATH_ROW_CAP` (engine-constants.ts) on both engines, and
+   * `truncated` is true when the walk hit it — rows past the cap (the
+   * DEEPEST edges under the ORDER BY depth contract) were dropped. The cap
+   * counts raw rows before the in-memory edge dedup, so `paths.length`
+   * alone cannot reveal truncation. `traversePaths` is the `.paths`
+   * projection; the op layer surfaces `truncated` as a stderr note so the
+   * GraphPath[] wire shape stays unchanged.
+   */
+  traversePathsDetailed(
+    slug: string,
+    opts?: PageReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+  ): Promise<{ paths: GraphPath[]; truncated: boolean }>;
   /**
    * Typed-edge relational fan-out for the relational recall arm (v0.43).
    *
@@ -1531,7 +1545,7 @@ export interface BrainEngine {
    * Keyed by page id — NOT slug — so namesake slugs across sources never
    * share or sum counts (#4380). Ids with zero links map to 0.
    */
-  getBacklinkCounts(pageIds: number[]): Promise<Map<number, number>>;
+  getBacklinkCounts(pageIds: number[], opts?: PageReadScope): Promise<Map<number, number>>;
   /**
    * v0.40.4 — for a list of page_ids, return adjacency aggregates
    * restricted to the subgraph induced by them. Returns ALL pages with
@@ -1544,7 +1558,7 @@ export interface BrainEngine {
    *     target's own source), in-set
    *
    * SOURCE-SCOPE CONTRACT: pageIds MUST already be source-scoped by the
-   * caller. This method does NOT filter by source_id. Adjacency is
+   * caller. An optional read scope authorizes endpoints and origins. Adjacency is
    * page-id keyed and the in-set restriction makes cross-source leakage
    * impossible BY CONSTRUCTION (a leaked-in page_id from another source
    * would have to also appear in the caller's input set, which the
@@ -1557,7 +1571,7 @@ export interface BrainEngine {
    * source" (codex outside-voice #15). T-todo-4 captures the v0.41+
    * sync-topology-aware refinement.
    */
-  getAdjacencyBoosts(pageIds: number[]): Promise<Map<number, AdjacencyRow>>;
+  getAdjacencyBoosts(pageIds: number[], opts?: PageReadScope): Promise<Map<number, AdjacencyRow>>;
   /**
    * v0.42 (issue #1699): for a list of page_ids, return their
    * `frontmatter.content_flag` markers (reason + detail). Used by hybrid
@@ -1568,6 +1582,7 @@ export interface BrainEngine {
    */
   getContentFlagsByPageIds(
     pageIds: number[],
+    opts?: PageReadScope,
   ): Promise<Map<number, { reason: string; detail: string }>>;
   /**
    * Extraction quarantine lane (issue #160), widened for #4220: for a list
@@ -1583,6 +1598,7 @@ export interface BrainEngine {
    */
   getUnverifiedExtractionPageIds(
     pageIds: number[],
+    opts?: PageReadScope,
   ): Promise<Map<number, { unverified: boolean; status: string }>>;
   /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
@@ -1602,7 +1618,7 @@ export interface BrainEngine {
    * Drives the new applyRecencyBoost post-fusion stage. Returns NULL for refs
    * with no row; map omits them.
    */
-  getEffectiveDates(refs: Array<{slug: string; source_id: string}>): Promise<Map<string, Date>>;
+  getEffectiveDates(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, Date>>;
   /**
    * v0.29.1: for a list of (slug, source_id) refs, return the salience score
    * (emotional_weight × 5 + ln(1 + take_count)) per ref. Single SQL query.
@@ -1612,7 +1628,7 @@ export interface BrainEngine {
    * (or zero emotional_weight + zero takes) get score = 0; the boost stage
    * skips them.
    */
-  getSalienceScores(refs: Array<{slug: string; source_id: string}>): Promise<Map<string, number>>;
+  getSalienceScores(refs: Array<{slug: string; source_id: string}>, opts?: PageReadPolicy): Promise<Map<string, number>>;
   /**
    * Return every page with no inbound links.
    * Domain comes from the frontmatter `domain` field (null if unset).
@@ -1635,11 +1651,23 @@ export interface BrainEngine {
    * no-inbound-only view (a page that links out but is never linked TO still
    * counts as an orphan there).
    */
-  findOrphanPages(opts?: {
+  /**
+   * #4280: rows carry `type` + `quarantined` so the shared orphan-reporting
+   * policy can exclude machine leaf types and quarantined shells that slug
+   * conventions cannot infer. SQL applies read authorization; reporting exclusions remain in
+   * ONE place (`shouldExcludeFromOrphanReporting`).
+   */
+  findOrphanPages(opts?: PageReadScope & {
     sourceId?: string;
     sourceIds?: string[];
     mode?: 'inbound' | 'islanded';
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>>;
+  }): Promise<Array<{
+    slug: string;
+    title: string;
+    domain: string | null;
+    type?: string | null;
+    quarantined?: boolean;
+  }>>;
 
   // Tags
   /**
@@ -1705,9 +1733,9 @@ export interface BrainEngine {
   /** Events/timeline rows on or after `date`, optionally filtered by event.kind. */
   getSince(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]>;
   /** "On this day" — events from the same month-day in PRIOR years (default: today). */
-  getOnThisDay(opts?: { date?: string; limit?: number; sourceId?: string; sourceIds?: string[] }): Promise<ChronicleTimelineRow[]>;
+  getOnThisDay(opts?: PageReadScope & { date?: string; limit?: number }): Promise<ChronicleTimelineRow[]>;
   /** Most recent date an entity appears (its own page or an event's `who`). */
-  getLastSeen(entitySlug: string, opts?: { asof?: string; sourceId?: string; sourceIds?: string[] }): Promise<LastSeenResult>;
+  getLastSeen(entitySlug: string, opts?: PageReadScope & { asof?: string }): Promise<LastSeenResult>;
   /**
    * Upsert the date-index projection row for an event page: page_id = depth
    * page, event_page_id = event page, keyed (event_page_id, date). Re-extraction
@@ -1731,7 +1759,7 @@ export interface BrainEngine {
   /** Meta-ontology: which dimensions exist across the brain, and how widely. */
   discoverOntologyDimensions(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<OntologyDimensionStat[]>;
   /** Dimensions with ≥2 distinct current-open values from ≥2 provenances. */
-  findOntologyConflicts(opts?: { sourceId?: string; sourceIds?: string[]; minConfidence?: number }): Promise<OntologyConflict[]>;
+  findOntologyConflicts(opts?: PageReadScope & { minConfidence?: number }): Promise<OntologyConflict[]>;
 
   // Raw data
   /**
@@ -1742,11 +1770,11 @@ export interface BrainEngine {
    */
   putRawData(slug: string, source: string, data: object, opts?: { sourceId?: string }): Promise<void>;
   /**
-   * v0.31.8 (D21): `opts.sourceId` source-scopes the page-id lookup. Without
-   * it, multi-source brains return raw_data rows from every same-slug page
-   * (preserved via two-branch query for back-compat).
+   * v0.31.8 (D21): `opts.sourceId` source-scopes the page-id lookup (without
+   * it, multi-source brains return rows from every same-slug page). Rows
+   * follow the page's soft-delete; `includeDeleted` (export/migration) opts in.
    */
-  getRawData(slug: string, source?: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<RawData[]>;
+  getRawData(slug: string, source?: string, opts?: PageReadScope & { includeDeleted?: boolean }): Promise<RawData[]>;
 
   // Files (v0.27.1: binary asset metadata + storage_path. Image bytes never
   // enter the DB; storage_path references a path inside the brain repo or an
@@ -2121,11 +2149,18 @@ export interface BrainEngine {
     opts?: FactListOpts,
   ): Promise<FactRow[]>;
 
-  /** List facts created since a given timestamp within a source. */
+  /**
+   * List facts since a given timestamp within a source (creation time by
+   * default; event time with `eventTime: true`, see FactListOpts). The
+   * optional `entitySlug` / `sessionId` filters AND onto the time window in
+   * the same SQL query, before LIMIT, so a caller composing "this entity (or
+   * session) since T" gets the newest matching rows rather than a
+   * post-filtered slice of the newest-N.
+   */
   listFactsSince(
     source_id: string,
     since: Date,
-    opts?: FactListOpts & { entitySlug?: string },
+    opts?: FactListOpts & { entitySlug?: string; sessionId?: string },
   ): Promise<FactRow[]>;
 
   /** List facts captured under a session id within a source. */
@@ -2155,7 +2190,9 @@ export interface BrainEngine {
   /**
    * v0.32: count facts that haven't been promoted to takes by the consolidate
    * phase yet (active + unconsolidated). Drives `gbrain recall --pending`.
-   * Single SQL: COUNT(*) WHERE consolidated_at IS NULL AND expired_at IS NULL.
+   * Single SQL: COUNT(*) WHERE consolidated_at IS NULL AND expired_at IS NULL
+   * AND (valid_until IS NULL OR valid_until > now()) — read-time TTL validity
+   * keeps this backlog in lockstep with what the consolidator can read.
    */
   countUnconsolidatedFacts(source_id: string): Promise<number>;
 
@@ -2187,9 +2224,12 @@ export interface BrainEngine {
    * - Visibility-filtered: when `opts.remote=true`, only `visibility='world'`
    *   facts are returned. Trusted local callers see both private + world.
    * - Optional metric filter restricts to a single normalized metric label.
-   * - Active-only by default (expired_at IS NULL); soft-deleted entities
-   *   on the pages side are NOT filtered here — trajectory is a facts-table
-   *   query and doesn't JOIN pages.
+   * - Active-only by default (expired_at IS NULL). DELIBERATELY no
+   *   valid_until clause: trajectory is a HISTORY view, and the consolidator
+   *   stamps valid_until on every non-newest point in a cluster — filtering
+   *   would collapse each trajectory to its final point. Soft-deleted
+   *   entities on the pages side are NOT filtered here — trajectory is a
+   *   facts-table query and doesn't JOIN pages.
    */
   findTrajectory(opts: TrajectoryOpts): Promise<TrajectoryPoint[]>;
 
@@ -2208,7 +2248,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]>;
+  getVersions(slug: string, opts?: PageReadScope): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the
@@ -2275,7 +2315,21 @@ export interface BrainEngine {
   resolveSlugWithAlias(
     slug: string,
     sourceOrSources: string | readonly string[],
+    opts?: Pick<PageReadScope, 'excludePrivate'>,
   ): Promise<string>;
+  /**
+   * `resolveSlugWithAlias` plus the OWNING source of the winning alias row
+   * (same scope + precedence rules), or null when no alias matches (or the
+   * table predates v104). A consumer that goes on to READ the canonical page
+   * must scope that read to `source_id`: a federated getPage prefers the
+   * anchor source, so an unrelated live page at the canonical slug in another
+   * granted source would otherwise shadow the alias owner's page.
+   */
+  resolveSlugWithAliasDetailed(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+    opts?: Pick<PageReadScope, 'excludePrivate'>,
+  ): Promise<{ canonical_slug: string; source_id: string } | null>;
 
   /**
    * T3 retrieval-cathedral — free-text alias resolution for SEARCH.
@@ -2292,7 +2346,7 @@ export interface BrainEngine {
    */
   resolveAliases(
     aliasNorms: string[],
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: PageReadScope,
   ): Promise<Map<string, Array<{ slug: string; source_id: string }>>>;
 
   /**
@@ -2360,11 +2414,11 @@ export interface BrainEngine {
   /**
    * v0.35.5 — lossless DB-side migration of fact rows from one slug to
    * another within a single source. UPDATEs `entity_slug` and
-   * `source_markdown_slug` on every active fact row whose
-   * `source_markdown_slug` matches the phantom slug. Every other column
-   * (embedding, valid_from, valid_until, kind, notability, confidence,
-   * source_session, status, etc.) is preserved verbatim — codex #3 fix
-   * for the writeFactsToFence lossy-migration trap.
+   * `source_markdown_slug` on every active fact row keyed on the phantom
+   * slug, and offsets `row_num` past the canonical page's current
+   * MAX(row_num) — all rows incl. expired, since partial idx_facts_fence_key
+   * only excludes NULL — so overlapping fence rows never collide (#4558);
+   * NULL row_num stays NULL. Every other column is preserved verbatim.
    *
    * Idempotent: re-run after success finds no rows to update and returns
    * `{migrated: 0}`. Hard-deletes are out of scope; the caller wipes the
@@ -2479,13 +2533,13 @@ export interface BrainEngine {
   ): Promise<CodeEdgeResult[]>;
 
   /**
-   * "What does this symbol call?" Returns edges from chunks whose
-   * from_symbol_qualified = qualifiedName. Same source-scoping semantics
-   * as getCallersOf.
+   * "What does this symbol call?" Edges from chunks whose from_symbol_qualified
+   * = qualifiedName; same source scoping as getCallersOf. opts.bareFallback (#4670):
+   * zero-row miss + delimiter-free input re-keys on content_chunks.symbol_name.
    */
   getCalleesOf(
     qualifiedName: string,
-    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean },
   ): Promise<CodeEdgeResult[]>;
 
   /**
@@ -2550,8 +2604,8 @@ export interface BrainEngine {
    * source — a slug-only UPDATE would fan out across sources, the same bug
    * that the v0.18.0 link batches fixed for cross-source edges.
    *
-   * Returns the count of rows actually updated. Pages whose `(slug, source_id)`
-   * tuple doesn't exist (race with delete) are silently skipped.
+   * Rewrites ONLY rows whose stored weight differs (`IS DISTINCT FROM`, #4797) —
+   * returns rows CHANGED; missing `(slug, source_id)` tuples are skipped.
    */
   setEmotionalWeightBatch(rows: EmotionalWeightWriteRow[]): Promise<number>;
 

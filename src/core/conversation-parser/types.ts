@@ -92,12 +92,12 @@ export interface ParseResult {
    *  decline (the parser stays purely descriptive). Undefined when empty so
    *  healthy-page JSON output is byte-identical. */
   unrecognized_headings?: string[];
-  /**
-   * Anchor lines whose date could not be parsed (rfc2822 zone words the
-   * engine rejects, malformed digits). Each one still opens a message,
-   * anchored on the page's fallback date, so its body is never folded into
-   * the previous speaker. Absent when zero.
-   */
+  /** Matched anchor lines whose date could not be reconstructed (localized
+   *  month names, malformed digits). Each still opens its own message —
+   *  inheriting the previous anchor's timestamp, or the page's fallback date
+   *  at midnight for the first — so its body is never folded into the
+   *  previous speaker. Undefined when zero so healthy-page JSON output is
+   *  byte-identical. */
   date_fallback_count?: number;
 }
 
