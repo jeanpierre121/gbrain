@@ -1403,6 +1403,7 @@ export async function drainStaleLinks(
   const drained = await extractStaleFromDB(engine, {
     dryRun: false,
     jsonMode: false,
+    quiet: true, // the cycle owns the report — no helper summary on stdout (keeps dream --json pure)
     includeFrontmatter,
     sourceIdFilter: sourceId,
     catchUp: false,

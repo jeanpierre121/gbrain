@@ -1363,6 +1363,18 @@ async function processPage(
           `entity resolution failed for ${JSON.stringify(raw)}: ${message}; preserving fact without an entity target\n`,
         );
       },
+      // Fork carry: a fallback_slugify result stays parented when it is a
+      // prefixed people/ or companies/ slug (extractor-asserted, registered as
+      // a fold target) or when it folds onto such a sibling already known
+      // from pages or facts written earlier; bare names with no sibling stay
+      // unparented (upstream's rule). Folds are counted here because they now
+      // happen before the save.
+      (rawSlug) => {
+        const canonical = state.canonicalizer.canonicalize(rawSlug);
+        if (typeof canonical !== 'string' || !canonical.includes('/')) return null;
+        if (canonical !== rawSlug) state.result.entity_slugs_canonicalized++;
+        return canonical;
+      },
     );
     const commitSegmentResolutionTelemetry = () => {
       mergeSaveTimeResolutionCounts(pageResolution, segmentResolution);

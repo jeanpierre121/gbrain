@@ -2524,7 +2524,7 @@ describe('email threads through the core: char cap, drops, folds, date fallback,
     expect(chat.pages_processed).toBe(0);
   });
 
-  test('an anchor with an unparseable date is kept as its own turn, anchored on the page date', async () => {
+  test('an anchor with an unparseable date is kept as its own turn on the previous anchor\'s timestamp', async () => {
     await thread('email-thread-baddate', 'Email thread: Bad date', [
       EMAIL_HDR('Alice Example', 'alice@example.com', 'Mon, 01 Jun 2026 09:00:00 +0000', 'sent'), '', 'alice body', '',
       EMAIL_HDR('Bob Example', 'bob@example.com', 'Mon, 01 Xxx 2026 10:00:00 +0000', 'received'), '', 'bob body',
@@ -2544,7 +2544,9 @@ describe('email threads through the core: char cap, drops, folds, date fallback,
     expect(r!.pages_processed).toBe(1);
     const all = turns.join('\n');
     expect(all).toContain('Alice Example [sent] (2026-06-01T09:00:00.000Z): alice body');
-    expect(all).toContain('Bob Example [received] (2026-06-18T00:00:00Z): bob body');
+    // Upstream #4681 narrow cut: a rescued anchor inherits the previous anchor's
+    // timestamp (midnight of the page date only for a FIRST anchor).
+    expect(all).toContain('Bob Example [received] (2026-06-01T09:00:00.000Z): bob body');
     expect(errs.join('')).toContain('email-thread-baddate: 1 anchor line(s) had an unparseable date');
   });
 

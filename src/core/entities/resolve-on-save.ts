@@ -72,12 +72,21 @@ function isAbortError(err: unknown): boolean {
  *
  * Unresolved references keep the fact unparented. Ordinary resolver failures
  * increment resolution_errors. Abort and BudgetExhausted propagate.
+ *
+ * Fork carry (run/full-facts): `foldFallback` lets a caller keep a
+ * fallback_slugify result parented when it names an entity under `people/`
+ * or `companies/`: an extractor-asserted prefixed slug, or a bare name that
+ * folds onto such a sibling already known from pages or facts written
+ * earlier (extract-conversation-facts' EntitySlugCanonicalizer). Only a
+ * returned prefixed slug counts; anything else keeps upstream's rule and the
+ * fact stays unparented. Nothing is minted.
  */
 export async function resolveExtractedEntitiesForSave(
   engine: BrainEngine,
   sourceId: string,
   facts: ExtractedFact[],
   onError?: (raw: string, message: string) => void,
+  foldFallback?: (rawSlug: string) => string | null | undefined,
 ): Promise<SaveTimeResolutionCounts> {
   const stats = emptySaveTimeResolutionCounts();
   for (let i = 0; i < facts.length; i++) {
@@ -85,7 +94,11 @@ export async function resolveExtractedEntitiesForSave(
     if (raw === null) continue;
     try {
       const resolved = await resolveEntitySlugWithSource(engine, sourceId, raw);
-      facts[i] = { ...facts[i], entity_slug: resolved?.source === 'fallback_slugify' ? null : resolved?.slug ?? null };
+      const folded = resolved?.source === 'fallback_slugify' ? foldFallback?.(resolved.slug) : undefined;
+      const parented = resolved?.source === 'fallback_slugify'
+        ? (typeof folded === 'string' && folded.includes('/') ? folded : null)
+        : resolved?.slug ?? null;
+      facts[i] = { ...facts[i], entity_slug: parented };
       if (!resolved) continue;
       stats.counts[resolved.source] = (stats.counts[resolved.source] ?? 0) + 1;
       if (resolved.source === 'fallback_slugify') {
