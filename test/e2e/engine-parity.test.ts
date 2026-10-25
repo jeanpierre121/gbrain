@@ -14,7 +14,11 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { createHash } from 'node:crypto';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { linkFamily, resolveChainAnchors, runRelationalChain } from '../../src/core/search/relational-chain.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { getSessionContextState, upsertSessionContextState } from '../../src/core/context/session-state.ts';
@@ -23,6 +27,7 @@ import { buildEntityCard } from '../../src/core/verbs/entity-card.ts';
 import { hasDatabase, setupDB, setupLegacyEmbeddingDB, teardownDB, getEngine } from './helpers.ts';
 import { TRAVERSE_PATH_ROW_CAP } from '../../src/core/engine-constants.ts';
 import { DENSE_HUB_SLUG, DENSE_HUB_SPOKES, seedDenseHub } from '../helpers/dense-hub.ts';
+import { timelinePageScans } from '../helpers/timeline-plan.ts';
 
 const SKIP_PG = !hasDatabase();
 const describeBoth = SKIP_PG ? describe.skip : describe;
@@ -100,7 +105,7 @@ async function seedEngine(eng: BrainEngine) {
         token_count: p.body.split(/\s+/).length,
       },
     ];
-    await eng.upsertChunks(p.slug, chunks);
+    await installFixtureChunks(eng, p.slug, chunks);
   }
 }
 
@@ -145,6 +150,57 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       expect(new Set(pgSlugs)).toEqual(new Set(pgliteSlugs));
     });
   }
+
+  test('searchKeyword honors exclude_slugs and type identically on BOTH engines (read-path audit #8)', async () => {
+    const q = 'fat code thin harness';
+    const pgAll = (await pgEngine.searchKeyword(q, { limit: 10 })).map((r: SearchResult) => r.slug);
+    expect(pgAll).toContain('concepts/fat-code-thin-harness');
+    const opts = { limit: 10, exclude_slugs: ['concepts/fat-code-thin-harness'] };
+    const pgEx = (await pgEngine.searchKeyword(q, opts)).map((r: SearchResult) => r.slug);
+    const pgliteEx = (await pgliteEngine.searchKeyword(q, opts)).map((r: SearchResult) => r.slug);
+    expect(pgEx).not.toContain('concepts/fat-code-thin-harness');
+    expect(new Set(pgliteEx)).toEqual(new Set(pgEx));
+    const typed = { limit: 10, type: 'concept' as const };
+    const pgTyped = (await pgEngine.searchKeyword(q, typed)).map((r: SearchResult) => r.type);
+    const pgliteTyped = (await pgliteEngine.searchKeyword(q, typed)).map((r: SearchResult) => r.type);
+    expect(pgTyped.length).toBeGreaterThan(0);
+    expect(pgTyped.every(t => t === 'concept')).toBe(true);
+    expect(pgliteTyped).toEqual(pgTyped);
+  });
+
+  test('findTrajectory keeps the NEWEST points under a limit on BOTH engines (read-path audit #4)', async () => {
+    for (const eng of [pgEngine, pgliteEngine] as BrainEngine[]) {
+      await eng.executeRaw(`DELETE FROM facts WHERE entity_slug = 'people/traj-parity'`);
+      for (let i = 0; i < 6; i++) {
+        await eng.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, valid_from, source, claim_metric, claim_value)
+           VALUES ('default', 'people/traj-parity', $1, 'fact', 'world', $2::timestamptz, 'test', 'mrr', $3)`,
+          [`mrr is ${i}`, new Date(Date.UTC(2024, 0, 1 + i)).toISOString(), i],
+        );
+      }
+    }
+    const opts = { entitySlug: 'people/traj-parity', remote: false, limit: 3 };
+    const pg = (await pgEngine.findTrajectory(opts)).map(p => p.value);
+    const pglite = (await pgliteEngine.findTrajectory(opts)).map(p => p.value);
+    expect(pg).toEqual([3, 4, 5]);
+    expect(pglite).toEqual(pg);
+  });
+
+  test('getTags excludePrivate / liveOnly behave identically on BOTH engines (read-path audit #19)', async () => {
+    for (const eng of [pgEngine, pgliteEngine] as BrainEngine[]) {
+      await eng.putPage('notes/tag-private', { type: 'note', title: 'P', compiled_truth: 'x', frontmatter: { visibility: 'private' } } as any);
+      await eng.putPage('notes/tag-gone', { type: 'note', title: 'G', compiled_truth: 'x' } as any);
+      await eng.addTag('notes/tag-private', 'p-tag');
+      await eng.addTag('notes/tag-gone', 'g-tag');
+      await eng.executeRaw(`UPDATE pages SET deleted_at = now() WHERE slug = 'notes/tag-gone'`);
+    }
+    for (const eng of [pgEngine, pgliteEngine] as BrainEngine[]) {
+      expect(await eng.getTags('notes/tag-private')).toEqual(['p-tag']);
+      expect(await eng.getTags('notes/tag-private', { excludePrivate: true })).toEqual([]);
+      expect(await eng.getTags('notes/tag-gone')).toEqual(['g-tag']);
+      expect(await eng.getTags('notes/tag-gone', { liveOnly: true })).toEqual([]);
+    }
+  });
 
   test('searchKeyword orFallback: relaxed rows tagged keyword_relaxed on BOTH engines (2026-09 #3617 follow-up)', async () => {
     // A query whose terms never co-occur in one chunk: zero strict recall,
@@ -302,7 +358,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     };
     for (const eng of [pgEngine, pgliteEngine]) {
       await eng.putPage('notes/parity-dense', { type: 'note', title: 'Parity Dense', compiled_truth: 'd.' });
-      await eng.upsertChunks(
+      await installFixtureChunks(eng,
         'notes/parity-dense',
         Array.from({ length: 120 }, (_, i) => ({
           chunk_index: i,
@@ -315,7 +371,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       for (let p = 0; p < 8; p++) {
         const slug = `notes/parity-sparse-${p}`;
         await eng.putPage(slug, { type: 'note', title: `Parity Sparse ${p}`, compiled_truth: 's.' });
-        await eng.upsertChunks(slug, [
+        await installFixtureChunks(eng, slug, [
           { chunk_index: 0, chunk_text: `ps ${p}`, chunk_source: 'compiled_truth', embedding: mk(0.6 - p * 0.001, 1200 + p), token_count: 2 },
         ]);
       }
@@ -402,9 +458,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     }];
 
     await pgEngine.putPage(slug, page);
-    await pgEngine.upsertChunks(slug, chunks);
+    await installFixtureChunks(pgEngine, slug, chunks);
     await pgliteEngine.putPage(slug, page);
-    await pgliteEngine.upsertChunks(slug, chunks);
+    await installFixtureChunks(pgliteEngine, slug, chunks);
 
     const results = [
       (await pgEngine.searchKeyword('unique citation projection evidence'))[0],
@@ -438,9 +494,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       chunk_source: 'compiled_truth' as const,
     }];
     await pgEngine.putPage(nonEmailSlug, nonEmailPage);
-    await pgEngine.upsertChunks(nonEmailSlug, nonEmailChunks);
+    await installFixtureChunks(pgEngine, nonEmailSlug, nonEmailChunks);
     await pgliteEngine.putPage(nonEmailSlug, nonEmailPage);
-    await pgliteEngine.upsertChunks(nonEmailSlug, nonEmailChunks);
+    await installFixtureChunks(pgliteEngine, nonEmailSlug, nonEmailChunks);
 
     for (const result of [
       (await pgEngine.searchKeyword('unique non-email subject gate evidence'))[0],
@@ -470,9 +526,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       embedding: basisEmbedding(78),
     }];
     await pgEngine.putPage(whitespaceSlug, whitespacePage);
-    await pgEngine.upsertChunks(whitespaceSlug, whitespaceChunks);
+    await installFixtureChunks(pgEngine, whitespaceSlug, whitespaceChunks);
     await pgliteEngine.putPage(whitespaceSlug, whitespacePage);
-    await pgliteEngine.upsertChunks(whitespaceSlug, whitespaceChunks);
+    await installFixtureChunks(pgliteEngine, whitespaceSlug, whitespaceChunks);
 
     for (const result of [
       (await pgEngine.searchKeyword('unique whitespace message id evidence'))[0],
@@ -497,7 +553,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       compiled_truth: 'parity test fixture content',
       timeline: '',
     });
-    await pgEngine.upsertChunks('test/parity-fixture', [{
+    await installFixtureChunks(pgEngine, 'test/parity-fixture', [{
       chunk_index: 0,
       chunk_text: 'parity test fixture content',
       chunk_source: 'compiled_truth',
@@ -511,7 +567,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       compiled_truth: 'parity test fixture content',
       timeline: '',
     });
-    await pgliteEngine.upsertChunks('test/parity-fixture', [{
+    await installFixtureChunks(pgliteEngine, 'test/parity-fixture', [{
       chunk_index: 0,
       chunk_text: 'parity test fixture content',
       chunk_source: 'compiled_truth',
@@ -579,7 +635,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
         compiled_truth: 'A document body that never mentions those words.',
         timeline: '',
       });
-      await eng.upsertChunks('wiki/title-arm-parity', [{
+      await installFixtureChunks(eng, 'wiki/title-arm-parity', [{
         chunk_index: 0,
         chunk_text: 'A document body that never mentions those words.',
         chunk_source: 'compiled_truth',
@@ -882,7 +938,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       ]);
       await eng.addLink(slug, peer, 'ctx v2', 'wikilink');
 
-      const chunks = await eng.getChunks(slug);
+      // Inspect the raw import replacement before its final projection seal.
+      expect(await eng.getChunks(slug)).toEqual([]);
+      const chunks = await eng.getChunks(slug, { includeUnsealed: true });
       expect(chunks).toHaveLength(1);
       expect(chunks[0].chunk_text).toBe('v2 chunk only');
       const links = await eng.getLinks(slug);
@@ -896,13 +954,13 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
       await eng.putPage('wiki/gcp-doc', {
         type: 'note', title: 'beta doc', compiled_truth: 'beta body', timeline: '',
       }, { sourceId: 'gcp-beta' });
-      await eng.upsertChunks('wiki/gcp-doc', [
+      await installFixtureChunks(eng, 'wiki/gcp-doc', [
         { chunk_index: 0, chunk_text: 'gcp beta chunk', chunk_source: 'compiled_truth' },
       ], { sourceId: 'gcp-beta' });
       await eng.putPage('wiki/gcp-doc', {
         type: 'note', title: 'default decoy', compiled_truth: 'decoy body', timeline: '',
       }, { sourceId: 'default' });
-      await eng.upsertChunks('wiki/gcp-doc', [
+      await installFixtureChunks(eng, 'wiki/gcp-doc', [
         { chunk_index: 0, chunk_text: 'gcp default decoy', chunk_source: 'compiled_truth' },
       ], { sourceId: 'default' });
     }
@@ -1113,9 +1171,9 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
 
   // Chunkless-page safety net (embed --stale detection gap): a page with
   // non-empty content but zero content_chunks rows (e.g. a putPage-only
-  // write) must be found on BOTH engines identically, and quarantined /
-  // embed_skip pages (intentionally chunkless by design) must be excluded
-  // identically on both. Isolated under a dedicated source.
+  // write) must be found on BOTH engines identically, quarantined pages
+  // (chunkless by design) excluded and a chunkless embed_skip page with a
+  // body included (#7174) identically on both. Isolated under a dedicated source.
   test('chunkless-page-with-content detection: Postgres ↔ PGLite parity', async () => {
     const SRC = 'chunkless-parity';
     for (const eng of [pgEngine, pgliteEngine]) {
@@ -1135,20 +1193,20 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
         type: 'note', title: 'Quarantined', compiled_truth: 'junk content',
         frontmatter: { quarantine: { reason: 'junk_pattern', detail: 'parity fixture', assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
-      // cp/skipped: chunkless BY DESIGN — must be excluded.
+      // cp/skipped: embed_skip with no chunk rows — included (#7174: writes keep its chunks since #6722).
       await eng.putPage('cp/skipped', {
         type: 'note', title: 'Skipped', compiled_truth: 'x'.repeat(500),
         frontmatter: { embed_skip: { reason: 'oversized', bytes: 500, assessed_at: new Date().toISOString() } },
       }, { sourceId: SRC });
     }
 
-    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
-    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(1);
+    expect(await pgEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
+    expect(await pgliteEngine.countChunklessPagesWithContent({ sourceId: SRC })).toBe(2);
 
     const pgRows = await pgEngine.listChunklessPagesWithContent({ sourceId: SRC });
     const pgliteRows = await pgliteEngine.listChunklessPagesWithContent({ sourceId: SRC });
-    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub']);
-    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub']);
+    expect(pgRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
+    expect(pgliteRows.map(r => r.slug)).toEqual(['cp/stub', 'cp/skipped']);
     expect(pgRows[0].compiled_truth).toBe('stub content, never chunked');
     expect(pgliteRows[0].compiled_truth).toBe(pgRows[0].compiled_truth);
 
@@ -1289,7 +1347,7 @@ async function seedRelational(eng: BrainEngine) {
   for (const [slug, type] of pages) {
     await eng.putPage(slug, { type, title: slug, compiled_truth: `${slug} body`, timeline: '' });
   }
-  await eng.upsertChunks('people/ep-inv-b', [{
+  await installFixtureChunks(eng, 'people/ep-inv-b', [{
     chunk_index: 0, chunk_text: 'b', chunk_source: 'compiled_truth',
     embedding: basisEmbedding(2), token_count: 1,
   }] satisfies ChunkInput[]);
@@ -1346,6 +1404,21 @@ describeBoth('Engine parity — relationalFanout', () => {
     const pg = await pgEngine.relationalFanout(seeds, { direction: 'both' });
     const pglite = await pgliteEngine.relationalFanout(seeds, { direction: 'both' });
     expect(shape(pg)).toEqual(shape(pglite));
+  });
+
+  test('multi-hop chain (relationalChainHop + runRelationalChain) identical across engines', async () => {
+    await pgEngine.addLink('companies/ep-widget', 'people/ep-emp-c', 'founded by c', 'founded', 'markdown');
+    await pgliteEngine.addLink('companies/ep-widget', 'people/ep-emp-c', 'founded by c', 'founded', 'markdown');
+    const plan = { hops: [{ linkTypes: linkFamily('invested_in'), toward: 'object' as const }, { linkTypes: ['founded'], toward: 'subject' as const }], excludeAnchor: false };
+    const run = async (eng: BrainEngine) => {
+      const anchors = await resolveChainAnchors(eng, 'people/ep-inv-a', {});
+      const { rows, diagnostics } = await runRelationalChain(eng, anchors, plan, {});
+      return { rows: rows.map(r => ({ ...r, page_id: 0, canonical_chunk_id: r.canonical_chunk_id != null })), diagnostics };
+    };
+    const pg = await run(pgEngine);
+    const pglite = await run(pgliteEngine);
+    expect(pg).toEqual(pglite);
+    expect(pg.rows.filter(r => r.role === 'answer').map(r => r.slug)).toEqual(['people/ep-emp-c']);
   });
 });
 
@@ -1469,6 +1542,58 @@ describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', 
       const pg = (await pgEngine.getTimeline('fed/doc', opts)).map(e => e.summary).sort();
       const pglite = (await pgliteEngine.getTimeline('fed/doc', opts)).map(e => e.summary).sort();
       expect(pg).toEqual(pglite);
+    }
+  });
+});
+
+// Cat7-1: the unscoped getTimeline read probes pages by (source_id, slug) on
+// both engines once statistics exist, and still unions every same-slug page.
+describeBoth('Engine parity — unscoped getTimeline plan (Cat7-1)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  async function seed(eng: BrainEngine) {
+    await eng.executeRaw(`INSERT INTO sources (id, name, local_path) VALUES ('beta', 'beta', '/tmp/beta') ON CONFLICT (id) DO NOTHING`);
+    await eng.executeRaw(`INSERT INTO pages (slug, type, title) SELECT 'people/person-' || g, 'person', 'Person ' || g FROM generate_series(0, 1999) g`);
+    await eng.putPage('people/person-7', { type: 'person', title: 'Person 7 (beta)', compiled_truth: 'beta copy' }, { sourceId: 'beta' });
+    await eng.addTimelineEntry('people/person-7', { date: '2026-02-02', source: 'notes', summary: 'default event' });
+    await eng.addTimelineEntry('people/person-7', { date: '2026-03-03', source: 'notes', summary: 'beta event' }, { sourceId: 'beta' });
+    await eng.executeRaw('ANALYZE sources, pages, timeline_entries');
+  }
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    await seed(pgEngine);
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    await seed(pgliteEngine);
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('unscoped getTimeline returns the same cross-source entries on both engines', async () => {
+    for (const slug of ['people/person-7', 'people/person-500']) {
+      const pg = (await pgEngine.getTimeline(slug)).map(e => e.summary);
+      expect(pg).toEqual((await pgliteEngine.getTimeline(slug)).map(e => e.summary));
+    }
+    expect((await pgEngine.getTimeline('people/person-7')).map(e => e.summary)).toEqual(['beta event', 'default event']);
+  });
+
+  test('both engines reach pages only through (source_id, slug) index probes', async () => {
+    for (const eng of [pgEngine, pgliteEngine]) {
+      for (const slug of ['people/person-7', 'people/person-500']) {
+        const scans = await timelinePageScans(eng, slug);
+        expect(scans.length).toBeGreaterThan(0);
+        for (const scan of scans) {
+          expect(scan.node).toMatch(/Index/);
+          expect(scan.cond).toContain('source_id');
+          expect(scan.cond).toContain('slug');
+        }
+      }
     }
   });
 });
@@ -1827,7 +1952,7 @@ describeBoth('Engine parity — CJK keyword fallback (#3986)', () => {
   async function seedCJK(eng: BrainEngine) {
     for (const [i, p] of CJK_PAGES.entries()) {
       await eng.putPage(p.slug, { type: 'note', title: p.title, compiled_truth: p.body, timeline: '' });
-      await eng.upsertChunks(p.slug, [{
+      await installFixtureChunks(eng, p.slug, [{
         chunk_index: 0,
         chunk_text: p.body,
         chunk_source: 'compiled_truth' as const,
@@ -2003,11 +2128,11 @@ describeBoth('Engine parity — traverseGraph / traversePaths (D7)', () => {
       'tg/b>tg/a:cycle-back@1',
       'tg/a>tg/b:cycle-fwd@2',
     ]);
-    // 'both' emits every touched edge in its natural direction; the cycle
-    // pair shows at depth 1 and again from b's frontier at depth 2.
+    // 'both' emits every touched edge once, in its natural direction, one
+    // hop past its shallower walked endpoint: the cycle pair at depth 1 only.
     expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 2, direction: 'both' }))).toEqual([
       'tg/a>tg/b:cycle-fwd@1', 'tg/b>tg/a:cycle-back@1',
-      'tg/a>tg/b:cycle-fwd@2', 'tg/b>tg/a:cycle-back@2', 'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
+      'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
     ]);
   });
 
@@ -2252,17 +2377,24 @@ describeBoth('Engine parity — restorePage arc (D7)', () => {
 describeBoth('Engine parity — open_loops loops-store round-trip', () => {
   let pgEngine: BrainEngine;
   let pgliteEngine: PGLiteEngine;
+  let pgFixture: Awaited<ReturnType<typeof isolatedPersistencePostgres>>;
 
   beforeAll(async () => {
-    pgEngine = await setupDB();
+    // Bootstrap fixtures can remove source FKs from the shared schema, leaving
+    // prior loops behind. Creation/dedup parity requires a fresh brain on both sides.
+    pgFixture = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
+    pgEngine = pgFixture.engine;
     pgliteEngine = new PGLiteEngine();
     await pgliteEngine.connect({});
     await pgliteEngine.initSchema();
   }, 90_000);
 
   afterAll(async () => {
-    await pgliteEngine.disconnect();
-    await teardownDB();
+    try {
+      await pgliteEngine?.disconnect();
+    } finally {
+      await pgFixture?.close();
+    }
   }, 30_000);
 
   // loops-store shares one SQL text across engines (parity by construction);
@@ -2344,6 +2476,42 @@ describeBoth('Engine parity — open_loops loops-store round-trip', () => {
     expect(pg.openAfterCount).toBe(0);
     expect(pg.doneAfterCount).toBe(1);
   });
+
+  async function lookupById(eng: BrainEngine) {
+    const { upsertOpenLoop, closeOpenLoop, listOpenLoops } = await import(
+      '../../src/core/loops/loops-store.ts'
+    );
+    await eng.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('lpid-a', 'lpid-a'), ('lpid-b', 'lpid-b') ON CONFLICT (id) DO NOTHING`,
+      [],
+    );
+    const row = await upsertOpenLoop(eng, {
+      sourceId: 'lpid-a',
+      dedupKey: 'thread:eeee000000000001:unanswered_inbound',
+      loopType: 'unanswered_inbound',
+      counterpartyEmail: 'erin@example.com',
+      summary: 'Reply owed to erin@example.com',
+      evidence: [{ message_id: 'eeee000000000001', quote: 'Any update?' }],
+      threadId: 'eeee000000000001',
+      detector: 'deterministic_thread',
+    });
+    await closeOpenLoop(eng, 'lpid-a', row.id, 'dropped', 'parity-lookup');
+    const hit = await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: row.id });
+    return {
+      hitIds: hit.map((r) => r.id === row.id),
+      hitStatus: hit[0]?.status,
+      otherSource: (await listOpenLoops(eng, { sourceIds: ['lpid-b'], loopId: row.id })).length,
+      statusMismatch: (await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: row.id, status: 'open' })).length,
+      beyondInt4: (await listOpenLoops(eng, { sourceIds: ['lpid-a'], loopId: 2 ** 40 })).length,
+    };
+  }
+
+  test('loopId lookup finds a closed row inside its source and nothing outside, on both engines', async () => {
+    const pg = await lookupById(pgEngine);
+    const pglite = await lookupById(pgliteEngine);
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual({ hitIds: [true], hitStatus: 'dropped', otherSource: 0, statusMismatch: 0, beyondInt4: 0 });
+  });
 });
 
 describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
@@ -2394,14 +2562,21 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
     );
     // Embedding-branch pair (separate entity keeps the recency-branch counts clean).
     const emb = basisEmbedding(101);
+    const embeddingModel = 'test:ttl-validity';
     await eng.insertFact(
-      { fact: 'ttl embed lapsed', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', valid_until: past, embedding: emb },
+      { fact: 'ttl embed lapsed', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', valid_until: past, embedding: emb, embedding_model: embeddingModel },
       { source_id: SRC },
     );
     await eng.insertFact(
-      { fact: 'ttl embed live', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', embedding: emb },
+      { fact: 'ttl embed live', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', embedding: emb, embedding_model: embeddingModel },
       { source_id: SRC },
     );
+    const stored = await eng.listFactsByEntity(SRC, EMB_ENTITY, { activeOnly: false });
+    expect(stored).toHaveLength(2);
+    for (const row of stored) {
+      expect(row.embedding_model).toBe(embeddingModel);
+      expect(row.embedded_text_hash).toBe(createHash('md5').update(row.fact).digest('hex'));
+    }
     // Ontology-writer-style supersession: valid_until close + superseded_by,
     // expired_at stays NULL (--asof time-travel intact).
     const oldRow = await eng.insertFact(
@@ -2424,7 +2599,9 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
       bySince: texts(await eng.listFactsSince(SRC, since, { entitySlug: ENTITY })),
       bySession: texts(await eng.listFactsBySession(SRC, SESSION)),
       dupRecency: texts(await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed fact')),
-      dupEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb })),
+      dupEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel })),
+      dupKeyword: (await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed future fact', { k: 5, arm: 'keyword' })).map(r => r.fact),
+      dupKeywordEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb, embeddingModel, arm: 'keyword' })),
       history: texts(await eng.listFactsByEntity(SRC, ENTITY, { activeOnly: false })),
       supersessions: texts(await eng.listSupersessions(SRC)),
       health: {
@@ -2449,6 +2626,10 @@ describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
     expect(pg.dupRecency).toEqual(activeEntity);
     // Lapsed row is not a dedup candidate → a re-stated fact re-inserts fresh.
     expect(pg.dupEmbedding).toEqual(['ttl embed live']);
+    // C2 keyword arm: same active-row filters, ranked by shared terms (most shared first).
+    expect(pg.dupKeyword[0]).toBe('ttl future fact');
+    expect([...pg.dupKeyword].sort()).toEqual(activeEntity);
+    expect(pg.dupKeywordEmbedding).toEqual(['ttl embed live']);
     // History (activeOnly:false) still shows every row.
     expect(pg.history).toEqual([
       'ttl durable fact', 'ttl future fact', 'ttl lapsed fact',
@@ -2484,7 +2665,7 @@ describeBoth('Engine parity — getCalleesOf bare-name fallback (#4670)', () => 
         type: 'code', page_kind: 'code', title: 'src/OrderService.cs (c_sharp)',
         compiled_truth: 'public async Task SubmitAsync() { ValidateRequest(); }', timeline: '',
       });
-      await eng.upsertChunks(slug, [{
+      await installFixtureChunks(eng, slug, [{
         chunk_index: 0,
         chunk_text: 'public async Task SubmitAsync() { ValidateRequest(); }',
         chunk_source: 'compiled_truth',

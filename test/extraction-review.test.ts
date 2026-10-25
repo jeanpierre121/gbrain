@@ -21,6 +21,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import {
   quarantineMarkers,
@@ -403,11 +404,13 @@ describe('enrichEntity created stubs are retrieval-visible (#3994)', () => {
   });
 
   test('pipeline failure: stderr-warns the downgrade, then the unchunked fallback still lands the page', async () => {
-    // importFromContent runs inside engine.transaction; the fallback putPage
-    // does not. Breaking transaction() forces the fallback arm only.
+    // importFromContent runs inside engine.transaction. The fallback putPage
+    // runs in its own attributed transaction (#5575: write attribution and the
+    // derived trust tier), so only the import's transaction is broken.
+    let transactions = 0;
     const failingEngine = new Proxy(engine, {
       get(target, prop) {
-        if (prop === 'transaction') {
+        if (prop === 'transaction' && transactions++ === 0) {
           return async () => { throw new Error('simulated pipeline boom'); };
         }
         const v = Reflect.get(target, prop, target);
@@ -627,8 +630,8 @@ describe('e2e: hostile transcript', () => {
     // 3. Chunk both with equal lexical relevance (distinct texts — identical
     //    ones would be Jaccard-deduped). Replace the imported stub's chunk
     //    and seed the control's chunk with comparable lexical evidence.
-    await engine.upsertChunks(stub!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon pivot details from the injected meeting', chunk_source: 'compiled_truth', token_count: 7 }]);
-    await engine.upsertChunks(real!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon launch update in my own written notes', chunk_source: 'compiled_truth', token_count: 7 }]);
+    await installFixtureChunks(engine, stub!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon pivot details from the injected meeting', chunk_source: 'compiled_truth', token_count: 7 }]);
+    await installFixtureChunks(engine, real!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon launch update in my own written notes', chunk_source: 'compiled_truth', token_count: 7 }]);
 
     // 4. Select the low-detail authority lane explicitly. The default detail
     // gives all chunks equal footing; only low enables compiled-truth boost.

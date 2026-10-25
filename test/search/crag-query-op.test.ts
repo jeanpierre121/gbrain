@@ -9,6 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { operationsByName } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import type { CragMetaBlock } from '../../src/core/search/crag.ts';
@@ -92,12 +93,37 @@ describe('query op — CRAG gate (#1663)', () => {
     expect(crag.escalate_to_think).toBe(true);
   }, 30000);
 
+  test('#5390: types: [] escalates exactly like an omitted filter (the re-run reuses the normalized types)', async () => {
+    await engine.setConfig('search.crag_escalation', 'true');
+    let keywordCalls = 0;
+    const counted = new Proxy(engine, {
+      get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (key === 'searchKeyword') return (...args: unknown[]) => { keywordCalls++; return (value as (...a: unknown[]) => unknown).apply(target, args); };
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const calls: number[] = [];
+    for (const types of [undefined, []]) {
+      keywordCalls = 0;
+      const { ctx, meta } = ctxWithMeta();
+      await operationsByName.query.handler({ ...ctx, engine: counted } as OperationContext,
+        { query: 'zxqv nonexistent quux', expand: false, ...(types ? { types } : {}) });
+      expect(cragOf(meta).escalated).toBe(true);
+      calls.push(keywordCalls);
+    }
+    expect(calls[1]).toBe(calls[0]);
+  }, 30000);
+
   test('remote and unset-trust escalation cannot adopt a matching private page', async () => {
     await engine.setConfig('search.crag_escalation', 'true');
     await engine.putPage('notes/private-crag', {
       type: 'note', title: 'Synthetic restricted record', compiled_truth: 'PRIVATE_CRAG_CANARY',
       frontmatter: { visibility: 'private' },
     });
+    await installFixtureChunks(engine, 'notes/private-crag', [
+      { chunk_index: 0, chunk_text: 'PRIVATE_CRAG_CANARY', chunk_source: 'compiled_truth' },
+    ]);
     await engine.upsertChunks('notes/private-crag', [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Synthetic restricted record PRIVATE_CRAG_CANARY' }]);
     for (const remote of [true, undefined]) {
       const { ctx, meta } = ctxWithMeta();
@@ -111,15 +137,19 @@ describe('query op — CRAG gate (#1663)', () => {
     expect(JSON.stringify(local)).toContain('PRIVATE_CRAG_CANARY');
   }, 30000);
 
-  test('#4610: default-shape caller (expand on) skips the re-run — the documented callerExpanded guard', async () => {
+  test('#4610 + GBRA-81 item 1b: a default-shape caller did not expand (the mode decides), so the guard lets the re-run fire', async () => {
     await engine.setConfig('search.crag_escalation', 'true');
     const { ctx, meta } = ctxWithMeta();
-    // No expand param → expand defaults to true → the first pass already
-    // used the high-ceiling expansion knob → no redundant re-query.
+    // No expand param: the resolved mode decides, and nothing expanded on this
+    // keyless brain. The callerExpanded guard reads expansion_applied, so the
+    // high-ceiling re-run is not redundant and runs once. The skip case (the
+    // first pass really expanded) is pinned in operation-expansion-contract.serial.test.ts.
     await operationsByName.query.handler(ctx, { query: 'zxqv nonexistent quux' });
     const crag = cragOf(meta);
+    expect((meta.retrieval as { expansion_applied?: boolean }).expansion_applied).toBe(false);
+    expect(crag.escalated).toBe(true);
+    expect(crag.escalated_confidence).toBe('weak');
     expect(crag.confidence).toBe('weak');
-    expect(crag.escalated).toBeUndefined();
     expect(crag.escalate_to_think).toBe(true);
   }, 30000);
 

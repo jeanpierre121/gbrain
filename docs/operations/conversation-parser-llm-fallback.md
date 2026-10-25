@@ -27,8 +27,7 @@ The key is registered explicitly, so neither command needs `--force`.
 Values other than the exact string `true` leave the fallback disabled.
 
 The setting affects conversation fact extraction. It does not make the
-synchronous `conversation-parser scan` command call a model, and it does not
-enable the separate LLM polish scaffold.
+synchronous `conversation-parser scan` command call a model.
 
 ## Select the utility model and run a canary
 
@@ -67,15 +66,16 @@ For each eligible conversation page, extraction:
 1. Reads the same body used by the deterministic parser, including a configured
    raw transcript sidecar for meeting pages.
 2. Calls `parseConversation(body, { page })`. Pages of type `email` add
-   `forcePatternId: 'email-thread-heading'`, which applies that pattern before
-   scoring.
+   `forcePatternId: 'email-collector-thread'` (the fork's email-collector
+   pattern), which applies that pattern before scoring.
 3. Uses the deterministic messages when any built-in pattern succeeds. Pages
-   of type `email` use only an `email-thread-heading` parse; another pattern's
+   of type `email` use only an `email-collector-thread` parse or upstream's
+   `email-thread-heading` parse (gbrain's Gmail render); another pattern's
    match is discarded and the page is audited as scanned-not-extractable.
 4. Calls the LLM fallback only when the parse phase is exactly `no_match`, the
    message list is empty, the opt-in key is `true`, and this is not a dry run.
 5. Splits accepted fallback messages into the normal extraction segments.
-   Pages of type `email` never call the fallback: only an `email-thread-heading`
+   Pages of type `email` never call the fallback: only a thread pattern
    parse carries sender and direction, so an email page with no such anchors
    keeps no segment and stays unfinished, and `pages_llm_fallback` does not
    count it.

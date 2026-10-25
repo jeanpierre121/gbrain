@@ -111,7 +111,7 @@ describe('resolveBrainDir: global key and nothing', () => {
 
 describe('resolveBrainDir: module contract', () => {
   test('the module never calls process.exit (callers own the exit-1 / failed-job decision)', () => {
-    // test-reads-source-ok: the no-process.exit rule is a property of the module text, not of any call path
+    // test-reads-source-ok[structural]: the no-process.exit rule is a property of the module text, not of any call path
     const src = readFileSync(new URL('../src/core/brain-dir.ts', import.meta.url), 'utf8');
     expect(src).not.toContain('process.exit');
   });

@@ -1,3 +1,5 @@
+import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
+import { managedPersistenceEnabled } from './persistence/ownership.ts';
 /**
  * gbrain sources-ops — pure async functions for source-management operations
  * (v0.28). Extracted from src/commands/sources.ts so the CLI handlers and the
@@ -39,6 +41,7 @@
 import { existsSync, mkdirSync, renameSync, rmSync, lstatSync, realpathSync } from 'fs';
 import { join, dirname, basename, resolve as resolvePath } from 'path';
 import { isPathContained, msysToNativePath } from './path-confine.ts';
+import { mkdirPrivate } from './atomic-write.ts';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import {
@@ -53,8 +56,12 @@ import {
 } from './git-remote.ts';
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
+import { googleTuningConfig } from './google/source-config.ts';
+import { isSyncStrategy, type SyncStrategy } from './sync.ts';
 import { DEFAULT_CALENDAR_ID } from './google/types.ts';
 import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
+import { deleteSourceRow } from './source-delete.ts';
+import { defaultCloneDir, isOwnedClone } from './url-clone.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -116,6 +123,8 @@ export interface SourceListEntry {
   local_path: string | null;
   remote_url: string | null;
   federated: boolean;
+  /** Persisted `config.strategy` (`gbrain sources set-strategy`); null means sync falls back to 'markdown'. */
+  strategy: SyncStrategy | null;
   page_count: number;
   last_sync_at: string | null;
 }
@@ -141,6 +150,8 @@ export interface SourceStatus {
 export interface AddSourceOpts {
   id: string;
   name?: string;
+  requestId?: string;
+  expectedIncarnation?: string;
   localPath?: string | null;
   remoteUrl?: string;
   federated?: boolean | null;
@@ -190,6 +201,12 @@ export interface AddSourceOpts {
     historyDays: number;
     /** Calendar swept by this source (default DEFAULT_CALENDAR_ID). */
     calendarId?: string;
+    /** #4845: directory under `dir` for contact pages (`g_contacts_dir`; default `people`). */
+    contactsDir?: string;
+    /** #5442: days ahead the calendar sweep covers (`g_future_days`; default CALENDAR_HORIZON_DAYS when absent). */
+    futureDays?: number;
+    /** #5445: Gmail label names/ids whose threads never enter loop extraction (`g_loops_exclude_labels`). */
+    loopsExcludeLabels?: string[];
     /** Managed dir where pages are materialized. */
     dir: string;
     /** Token acquisition: gbrain vault (default), a token-printing command, or an env var. */
@@ -205,6 +222,8 @@ export interface RemoveSourceOpts {
   yes?: boolean;
   dryRun?: boolean;
   keepStorage?: boolean;
+  requestId?: string;
+  expectedIncarnation?: string;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -294,11 +313,6 @@ async function countVisiblePages(engine: BrainEngine, id: string): Promise<numbe
   return rows[0]?.n ?? 0;
 }
 
-/** Default clone dir for a remote-URL source: $GBRAIN_HOME/clones/<id>/ */
-export function defaultCloneDir(id: string): string {
-  return gbrainPath('clones', id);
-}
-
 /** Temp clone dir under $GBRAIN_HOME/clones/.tmp/<id>-<rand>/ */
 function makeTempCloneDir(id: string): string {
   const rand = randomBytes(6).toString('hex');
@@ -310,39 +324,8 @@ function makeTempCloneDir(id: string): string {
 // importers (and recloneIfMissing below) keep working unchanged.
 export { isPathContained };
 
-/**
- * Did gbrain CREATE this clone (so re-clone/delete is safe)? Ownership, NOT
- * path-containment — a user-supplied working tree is NEVER owned, even if it
- * happens to sit under $GBRAIN_HOME. This is the #1881 guard: recloneIfMissing
- * deletes local_path, so it must only ever fire on a clone gbrain owns.
- *
- * Ownership is proven by either:
- *   1. config.managed_clone === true — written by addSource's --url path
- *      (covers both default-location and --clone-dir clones), OR
- *   2. local_path === defaultCloneDir(id) — back-compat for clones created
- *      before the marker existed (gbrain's default location), via exact
- *      normalized-path equality (symlink-free, so none of isPathContained's
- *      symlinked-parent / lexical-escape edge cases apply).
- *
- * Everything else is fail-closed (NOT owned → refuse to touch): the bug's
- * federated row (remote_url + a user tree), and pre-marker --clone-dir clones
- * (rare, local-only) which are byte-for-byte indistinguishable from it. Those
- * must be re-added to regain auto-reclone — the correct trade-off when ownership
- * is unprovable.
- */
-export function isOwnedClone(src: {
-  id: string;
-  local_path: string | null;
-  config: unknown;
-}): boolean {
-  if (!src.local_path) return false;
-  const cfg =
-    typeof src.config === 'string'
-      ? (JSON.parse(src.config) as Record<string, unknown>)
-      : ((src.config ?? {}) as Record<string, unknown>);
-  if (cfg.managed_clone === true) return true;
-  return resolvePath(src.local_path) === resolvePath(defaultCloneDir(src.id));
-}
+// `isOwnedClone` and `defaultCloneDir` live in url-clone.ts (shared with the #6946 write guards).
+export { defaultCloneDir, isOwnedClone };
 
 /**
  * Recovery hint for an unowned source with a remote_url. Splits guidance by
@@ -435,6 +418,8 @@ export async function addSource(
   engine: BrainEngine,
   opts: AddSourceOpts,
 ): Promise<SourceRow> {
+  if(await managedPersistenceEnabled(engine))return (await import('./persistence/managed-sources.ts')).addManagedSource(engine,opts);
+  await assertUnmanagedCanonicalWriter(engine, 'sources add');
   validateSourceId(opts.id);
 
   // gbrain#2955: normalize a Git Bash / MSYS drive path (`/c/Users/x`,
@@ -641,7 +626,7 @@ export async function addSource(
     // vault; config carries only the account POINTER (mirrors gh_token_env
     // storing an env NAME — check:source-config-leak stays trivially green).
     const finalPath = opts.google.dir;
-    mkdirSync(finalPath, { recursive: true });
+    mkdirPrivate(finalPath);
     const config: Record<string, unknown> = {
       kind: 'google',
       g_account: opts.google.account,
@@ -649,9 +634,7 @@ export async function addSource(
       g_history_days: opts.google.historyDays,
       // Only written when non-default so every existing source's config keeps
       // its exact shape (DEFAULT_CALENDAR_ID stays the parse-time fallback).
-      ...(opts.google.calendarId && opts.google.calendarId !== DEFAULT_CALENDAR_ID
-        ? { g_calendar_id: opts.google.calendarId }
-        : {}),
+      ...googleTuningConfig(opts.google),
       // Non-vault access (v0.47): 'command' runs g_token_command locally at
       // sync time (same trust class as recipe health_check argv — the google
       // kind is hard-rejected on remote sources_add and these keys are not
@@ -885,6 +868,7 @@ export async function listSources(
       local_path: r.local_path,
       remote_url: typeof cfg.remote_url === 'string' ? cfg.remote_url : null,
       federated: cfg.federated === true,
+      strategy: isSyncStrategy(cfg.strategy) ? cfg.strategy : null,
       page_count: await countVisiblePages(engine, r.id),
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
     });
@@ -926,6 +910,15 @@ export async function removeSource(
     );
   }
 
+  if(await managedPersistenceEnabled(engine)){
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'remove',sourceId:opts.id,confirmDestructive:opts.confirmDestructive||opts.yes,
+      dryRun:opts.dryRun,requestId:opts.requestId,expectedIncarnation:opts.expectedIncarnation});
+    if(!opts.dryRun)(await import('./persistence/managed-sources.ts')).assertTopologyCommitted(result);
+    return {id:opts.id,pages_deleted:Number(result.pages_deleted??0),clone_removed:false,
+      clone_path:typeof result.local_path==='string'?result.local_path:typeof result.path==='string'?result.path:null,dryRun:opts.dryRun===true};
+  }
+
   const src = await fetchSourceRow(engine, opts.id);
   if (!src) {
     throw new SourceOpError('not_found', `Source "${opts.id}" not found.`);
@@ -942,6 +935,9 @@ export async function removeSource(
       dryRun: true,
     };
   }
+
+
+  await assertUnmanagedCanonicalWriter(engine, 'sources remove');
 
   // Confirmation gate (caller should usually have already shown the impact
   // preview from destructive-guard.ts).
@@ -991,7 +987,7 @@ export async function removeSource(
     }
   }
 
-  await engine.executeRaw(`DELETE FROM sources WHERE id = $1`, [opts.id]);
+  await deleteSourceRow(engine, opts.id);
 
   return {
     id: opts.id,
@@ -1062,6 +1058,18 @@ export async function recloneIfMissing(
   engine: BrainEngine,
   id: string,
 ): Promise<boolean> {
+  if(await managedPersistenceEnabled(engine)){
+    const src=await fetchSourceRow(engine,id);
+    if(!src)throw new SourceOpError('not_found',`Source "${id}" not found.`);
+    const remoteUrl=getRemoteUrl(src.config);
+    if(!remoteUrl||!src.local_path)return false;
+    const binding=await (await import('./persistence/ownership.ts')).getWorktreeBinding(engine,id);
+    if(binding?.local_path&&existsSync(binding.local_path)&&validateRepoState(binding.local_path,remoteUrl)==='healthy')return false;
+    const {runManagedSourceLifecycle}=await import('./persistence/source-lifecycle.ts');
+    const result=await runManagedSourceLifecycle(engine,{operation:'reclone',sourceId:id});
+    (await import('./persistence/managed-sources.ts')).assertTopologyCommitted(result);return true;
+  }
+  await assertUnmanagedCanonicalWriter(engine, 'sources reclone');
   const src = await fetchSourceRow(engine, id);
   if (!src) {
     throw new SourceOpError('not_found', `Source "${id}" not found.`);

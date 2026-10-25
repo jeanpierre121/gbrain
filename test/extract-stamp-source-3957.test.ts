@@ -90,6 +90,21 @@ describe('#3957 parseTimelineEntries — FS/DB source split parity', () => {
     expect(db[0].source).toBe(fs[0].source);
   });
 
+  test('#5282: a spaced hyphen is an accepted Source delimiter; a colon stays prose', () => {
+    for (const dash of ['-', '–', '—']) {
+      const line = `- **2026-01-03** | Meeting ${dash} Agreed on the Q2 plan`;
+      const db = parseTimelineEntries(line);
+      const fs = extractTimelineFromContent(line, 'x');
+      expect(db).toEqual([{ date: '2026-01-03', summary: 'Agreed on the Q2 plan', detail: '', source: 'Meeting' }]);
+      expect({ source: fs[0].source, summary: fs[0].summary }).toEqual({ source: 'Meeting', summary: 'Agreed on the Q2 plan' });
+    }
+    const colon = '- **2026-01-02** | Meeting: Agreed on the Q2 plan';
+    const db = parseTimelineEntries(colon);
+    const fs = extractTimelineFromContent(colon, 'x');
+    expect(db).toEqual([{ date: '2026-01-02', summary: 'Meeting: Agreed on the Q2 plan', detail: '', source: 'markdown' }]);
+    expect({ source: fs[0].source, summary: fs[0].summary }).toEqual({ source: 'markdown', summary: 'Meeting: Agreed on the Q2 plan' });
+  });
+
   test('Chinese pipe-separated bullet splits too', () => {
     const db = parseTimelineEntries('- 2020年1月2日 | 董事会 — 决定融资');
     expect(db).toHaveLength(1);
@@ -281,8 +296,10 @@ describe('#3957 put_page auto-timeline threads ctx.sourceId', () => {
       slug: 'people/bob',
       content: `# Bob\n\n${CANON_BULLET}\n`,
       type: 'person',
-    }) as { auto_timeline?: { created?: number } };
-    expect(result.auto_timeline?.created).toBe(1);
+    }) as { write_request: { state: string } };
+    // Timeline projection now commits with the canonical receipt; it is no
+    // longer a best-effort post-write extraction advisory.
+    expect(result.write_request.state).toBe('committed');
 
     const rows = await engine.executeRaw<{ source_id: string; source: string; summary: string }>(
       `SELECT p.source_id, te.source, te.summary
