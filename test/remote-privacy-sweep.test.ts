@@ -33,7 +33,10 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { withEnv } from './helpers/with-env.ts';
+import { registerLocalWriter } from '../src/core/persistence/identity.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -99,7 +102,7 @@ let brainDir: string;
 function localCtx(sourceId = 'default'): OperationContext {
   return {
     engine,
-    config: {},
+    config: { engine: 'pglite', embedding_disabled: true },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
     remote: false,
@@ -120,7 +123,8 @@ type Shape = 'scalar' | 'federated';
  * shipped HTTP transport, which always resolves a scalar default.
  */
 async function sweepCall(name: string, params: Record<string, unknown>, shape: Shape) {
-  return dispatchToolCall(engine, name, params, {
+  return withEnv({ GBRAIN_HOME: home }, async () => {
+  const response = await dispatchToolCall(engine, name, params, {
     remote: true,
     transport: 'http',
     takesHoldersAllowList: ['world'],
@@ -130,12 +134,17 @@ async function sweepCall(name: string, params: Record<string, unknown>, shape: S
       ? {
           auth: {
             token: 'test-token',
-            clientId: 'test-client',
+            clientId: 'gbrain_cl_privacy_read',
+            principal: { kind: 'oauth_client', id: 'gbrain_cl_privacy_read' },
+            sourceId: 'default',
             scopes: ['read'],
             allowedSources: ['default', SRC2],
           },
         }
       : {}),
+  });
+  await disposePersistenceConsumer(engine);
+  return response;
   });
 }
 
@@ -149,7 +158,10 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
   fetch: { id: WORLD_FENCE_SLUG },
   list_pages: {},
   search: { query: 'WORLDSWEEP' },
+  // 'SWEEP_' is inside every PRIVATE sentinel too: the literal scan must still return only world text.
+  search_exact: { phrase: 'SWEEP_' },
   query: { query: 'WORLDSWEEP' },
+  assemble_evidence: { hits: [{ source_id: 'default', slug: WORLD_FENCE_SLUG, chunk_id: 0 }], return_unit: 'page' },
   recall: { entity: WORLD_PAGE_SLUG },
   entity: { name: WORLD_PAGE_SLUG },
   synthesize: { entity: WORLD_PAGE_SLUG },
@@ -162,7 +174,9 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
   get_links: { slug: WORLD_PAGE_SLUG },
   get_backlinks: { slug: WORLD_PAGE_SLUG },
   traverse_graph: { slug: WORLD_PAGE_SLUG },
-  get_versions: { slug: WORLD_FENCE_SLUG },
+  rank_entities: {},
+  get_versions: { slug: WORLD_FENCE_SLUG, include_body: true },
+  get_write_attribution: { slug: WORLD_FENCE_SLUG, versions: true },
   get_chunks: { slug: WORLD_FENCE_SLUG },
   resolve_slugs: { partial: 'world-page' },
   volunteer_context: { window: 'Recent discussion about WORLDSWEEP topics and pages.' },
@@ -175,12 +189,26 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
   find_contradictions: {},
   search_by_image: {},
   sources_status: { id: 'default' },
+  sources_resolve_path: { id: 'default', paths: ['notes/sweep-example.md'] },
   ontology_get: { entity: WORLD_PAGE_SLUG },
   get_skill: { name: 'query' },
   // Mutating ops target FRESH slugs only — never the seeded corpus. The
   // put_page-into-fence-bearing-page restoration-echo class is explicitly
   // NOT covered here (write-side sweep TODO).
   put_page: { slug: 'notes/sweep-fresh-write', content: '# Fresh write\n\nNew content.\n' },
+  put_pages: { request_id: '6007a5e0-0000-4000-8000-000000000001', pages: [{ slug: 'notes/sweep-fresh-batch', content: '# Fresh batch\n\nNew content.\n' }] },
+  // A stale revision on the fence-bearing page: the refusal must not echo it.
+  edit_page: { slug: WORLD_FENCE_SLUG, expected_revision: '00000000-0000-4000-8000-000000000000', edits: [{ old_text: 'x', new_text: 'y' }] },
+  // A stale revision on the fence-bearing page: the refusal must not echo it or its tail.
+  append_page: { slug: WORLD_FENCE_SLUG, request_id: '6007a5e0-0000-4000-8000-000000000002', expected_revision: '00000000-0000-4000-8000-000000000000', text: 'fresh sweep append' },
+  // An upload replacing the private page: the remote caller cannot see it, so begin answers as put_page does for an
+  // invisible page and stages nothing.
+  begin_page_upload: { slug: PRIV_PAGE_SLUG, mode: 'replace', total_bytes: 32, sha256: '0'.repeat(64), expected_revision: '00000000-0000-4000-8000-000000000000', request_id: '6007a5e0-0000-4000-8000-000000000003' },
+  // A session this caller did not begin: every session op answers upload_not_found.
+  upload_page_part: { upload_id: '6007a5e0-0000-4000-8000-000000000004', part: 0, text: 'fresh sweep part', part_sha256: 'af8002248c8537e357edd4eea4a9cacbaf864c4e5e0e7218f4cd808895fe1363' },
+  get_page_upload: { upload_id: '6007a5e0-0000-4000-8000-000000000004' },
+  commit_page_upload: { upload_id: '6007a5e0-0000-4000-8000-000000000004' },
+  abort_page_upload: { upload_id: '6007a5e0-0000-4000-8000-000000000004' },
   remember: { fact: 'fresh sweep fact', provenance: 'sweep', entity: 'people/sweep-fresh-entity' },
   capture: { content: 'fresh sweep capture' },
   add_tag: { slug: WORLD_PAGE_SLUG, tag: 'sweep-tag' },
@@ -196,6 +224,13 @@ const PARAM_FACTORY: Record<string, Record<string, unknown>> = {
 // Per-(op × shape) overrides for ops whose behavior legitimately differs
 // with vs without an authenticated OAuth identity (the federated shape
 // carries ctx.auth; the scalar shape — like the stdio transport — doesn't).
+// These operations enforce durable write authority inside the shared dispatcher.
+// Other scope checks remain transport-owned and outside this privacy harness.
+const COORDINATED_WRITES = new Set(['put_page', 'put_pages', 'capture', 'delete_page', 'restore_page', 'revert_version', 'edit_page', 'append_page',
+  'remember', 'forget', 'add_tag', 'remove_tag', 'add_timeline_entry',
+  'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
+  'get_write_request', 'list_write_requests', 'cancel_write_request']);
+
 const EXPECTED_BY_SHAPE: Record<string, Partial<Record<Shape, Outcome>>> = {
   whoami: { scalar: 'error', federated: 'ok' },
   list_jobs: { scalar: 'error', federated: 'ok' },
@@ -219,7 +254,9 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   fetch: 'data',
   list_pages: 'data',
   search: 'data',
+  search_exact: 'data',
   query: 'data',
+  assemble_evidence: 'data',
   recall: 'data',
   entity: 'data',
   delta: 'data',
@@ -232,6 +269,7 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   resolve_slugs: 'data',
   get_backlinks: 'data',
   traverse_graph: 'data',
+  rank_entities: 'data',
   // reads that succeed without corpus-marker requirement
   get_tags: 'ok',
   get_links: 'ok',
@@ -241,7 +279,9 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   whoami: 'ok', // base unused — per-shape override in EXPECTED_BY_SHAPE (above)
   sources_list: 'ok',
   sources_status: 'ok',
+  sources_resolve_path: 'error',
   find_orphans: 'ok',
+  wanted_pages: 'ok',
   find_contradictions: 'ok',
   find_experts: 'ok',
   find_trajectory: 'ok',
@@ -276,10 +316,12 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   search_stats: 'ok',
   cache_stats: 'ok',
   get_usage: 'ok',
+  get_write_attribution: 'ok',
   get_job_stats: 'ok',
   list_jobs: 'ok', // base unused — per-shape override in EXPECTED_BY_SHAPE (above)
   quarantine_list: 'ok',
   run_doctor: 'ok',
+  get_brain_health: 'ok', // bands only: counts as ranges, no slugs or stored text
   get_ingest_log: 'ok',
   code_callers: 'error',
   code_callees: 'error',
@@ -298,13 +340,30 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   search_tune: 'ok',
   // publish-gated (DB-plane rows pinned false in beforeAll)
   list_skills: 'denied',
+  get_skill_asset: 'error',
+  get_skill_policy: 'error',
+  set_skill_policy: 'error',
+  put_skill: 'error',
+  delete_skill: 'error',
+  join_brain: 'error',
+  sync_brain_skills: 'error',
+  leave_brain: 'error',
   get_skill: 'denied',
   list_brain_skillpack: 'denied',
   advisor: 'denied',
   // mutating ops (fresh-slug targets; envelope-echo checks only)
   remember: 'ok',
   forget: 'error',
+  purge_fact: 'error',
+  list_page_purges: 'error',
+  unpurge_page: 'error',
+  // Owner confirmation needs a memory_confirm grant; the sweep's connection has none (refused before any read).
+  confirm_memory: 'error',
+  // rate_answer with no answer_id is a validation error; a real answer id only
+  // ever names pages that answer returned to the same client.
+  rate_answer: 'error',
   put_page: 'ok',
+  put_pages: 'ok',
   delete_page: 'ok',
   restore_page: 'ok',
   capture: 'ok',
@@ -313,7 +372,20 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   add_link: 'ok',
   remove_link: 'ok',
   add_timeline_entry: 'ok',
+  get_write_request: 'error',
+  list_write_requests: 'ok',
+  list_write_conflicts: 'ok',
+  cancel_write_request: 'error',
   revert_version: 'error',
+  edit_page: 'error',
+  append_page: 'error',
+  // Page uploads: begin on the invisible private page refuses page_not_found like put_page (permission_denied under the
+  // read-only federated grant); the session ops refuse upload_not_found in both shapes.
+  begin_page_upload: 'error',
+  upload_page_part: 'error',
+  get_page_upload: 'error',
+  commit_page_upload: 'error',
+  abort_page_upload: 'error',
   put_raw_data: 'error',
   log_ingest: 'error',
   takes_add: 'ok',
@@ -336,9 +408,20 @@ const EXPECTED_OUTCOME: Record<string, Outcome> = {
   loops_close: 'error',
   loops_mute: 'error',
   loops_unmute: 'error',
+  // agent contract v1 A6: the generic invocation omits the required `code` → validation error.
+  mute_notice: 'error',
+  // C4 pinned questions are owner-private: a sweep caller cannot read private
+  // pages, so every questions_* op refuses with question_owner_only (leakage
+  // matrix: test/helpers/pinned-questions-scenarios.ts).
+  questions_pin: 'error',
+  questions_list: 'error',
+  questions_status: 'error',
+  questions_refresh: 'error',
+  questions_unpin: 'error',
   sources_remove: 'error',
   submit_job: 'error',
   get_job: 'error',
+  wait_job: 'error',
   cancel_job: 'error',
   retry_job: 'error',
   get_job_progress: 'error',
@@ -365,6 +448,9 @@ const localOnlyOps = operations.filter(o => o.localOnly);
 
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), 'gbrain-privacy-sweep-'));
+  await withEnv({ GBRAIN_HOME: home }, async () => {
+  mkdirSync(join(home, '.gbrain'));
+  writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({ engine: 'pglite', embedding_disabled: true }));
   src2Dir = mkdtempSync(join(tmpdir(), 'gbrain-privacy-sweep-src2-'));
   __setUsageLogPathForTests(join(home, 'usage.jsonl'));
   // Hermeticity is ENFORCED, not assumed: null BOTH gateway transports
@@ -391,6 +477,8 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  await registerLocalWriter(engine, 'stdio');
+  await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_name,scope,source_id,federated_read) VALUES('gbrain_cl_privacy_read','Privacy read fixture','read','default',$1)`, [['default', SRC2]]);
 
   // Takes are markdown-canonical — resolveTakesRepoDir reads the
   // `sync.repo_path` config key, so point it (and the default source's
@@ -538,9 +626,12 @@ type: person
 world source-2 body
 `,
   });
-});
+  await disposePersistenceConsumer(engine);
+  });
+}, 120_000);
 
 afterAll(async () => {
+  await disposePersistenceConsumer(engine);
   await engine.disconnect();
   __setUsageLogPathForTests(null);
   // Leave the process exactly as found: reset gateway config + transports
@@ -567,11 +658,18 @@ function assertNoPrivateSentinel(op: string, serialized: string) {
 }
 
 async function runCase(opName: string, shape: Shape) {
-  const params = PARAM_FACTORY[opName] ?? {};
+  const params = { ...(PARAM_FACTORY[opName] ?? {}) };
+  if (shape === 'scalar' && ['delete_page', 'restore_page'].includes(opName)) {
+    const snapshot = await engine.readPageSnapshot(String(params.slug), { sourceId: 'default', includeDeleted: true });
+    if (snapshot) params.expected_revision = snapshot.revision;
+  }
   const res = await sweepCall(opName, params, shape);
   const serialized = JSON.stringify(res);
   assertNoPrivateSentinel(opName, serialized);
-  const expected = EXPECTED_BY_SHAPE[opName]?.[shape] ?? EXPECTED_OUTCOME[opName];
+  // The federated fixture deliberately holds READ authority only. A read
+  // federation grant cannot authorize writes or receipt administration.
+  const readOnlyRefusal = shape === 'federated' && COORDINATED_WRITES.has(opName);
+  const expected = readOnlyRefusal ? 'error' : EXPECTED_BY_SHAPE[opName]?.[shape] ?? EXPECTED_OUTCOME[opName];
   const isError = res.isError === true;
   if (expected === 'data') {
     expect(isError).toBe(false);

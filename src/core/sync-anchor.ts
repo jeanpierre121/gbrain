@@ -1,9 +1,11 @@
+import { withCompanyBrainSource } from './company-brain/profile.ts';
 /**
  * Sync anchor + chunker-version state helpers (source-scoped vs legacy
  * global-config storage). Peeled out of src/commands/sync.ts (containment
  * sprint C13-C14) as a pure move.
  */
 import { realpathSync } from 'fs';
+import { syncDispatchRow } from './sync-dispatch-read.ts';
 import { resolve as pathResolve } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type { SyncOpts } from '../commands/sync.ts';
@@ -23,6 +25,9 @@ export async function readSyncAnchor(
   which: 'repo_path' | 'last_commit',
 ): Promise<string | null> {
   if (sourceId) {
+    // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the repo path (sync-dispatch-read.ts).
+    const routing = which === 'repo_path' ? await syncDispatchRow(engine, sourceId) : undefined;
+    if (routing) return routing.local_path;
     const col = which === 'repo_path' ? 'local_path' : 'last_commit';
     const rows = await engine.executeRaw<Record<string, string | null>>(
       `SELECT ${col} AS value FROM sources WHERE id = $1`,
@@ -230,6 +235,7 @@ export async function writeSyncAnchor(
   // it on a legacy-path last_commit write keep pre-#2114 behavior.
   repoDir?: string,
 ): Promise<void> {
+  return withCompanyBrainSource(engine, sourceId, async engine => {
   if (sourceId) {
     const col = which === 'repo_path' ? 'local_path' : 'last_commit';
     // last_sync_at bookmarked on every last_commit advance.
@@ -268,6 +274,8 @@ export async function writeSyncAnchor(
           [value, sourceId],
         );
       }
+      // GBRA-133 PR 2a: the host that advanced a classic source is the one whose resident notifier watches it.
+      await (await import('./notifier/store.ts')).recordLocalSyncer(engine, sourceId);
     } else {
       // #4369: repo_path repoints require directory-identity EQUALITY
       // (ownsSourceSyncAnchor); last_commit advances above use the weaker
@@ -310,6 +318,7 @@ export async function writeSyncAnchor(
     }
   }
   await engine.setConfig(`sync.${which}`, value);
+  });
 }
 
 /**
@@ -342,11 +351,13 @@ export async function writeChunkerVersion(
   sourceId: string | undefined,
   version: string,
 ): Promise<void> {
+  return withCompanyBrainSource(engine, sourceId, async engine => {
   if (!sourceId) return;
   await engine.executeRaw(
     `UPDATE sources SET chunker_version = $1 WHERE id = $2`,
     [version, sourceId],
   );
+  });
 }
 
 // ─── #4342 — sticky per-source slug-root mode ─────────────────────────────

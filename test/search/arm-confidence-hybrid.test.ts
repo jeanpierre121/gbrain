@@ -23,7 +23,8 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import { basisEmbedding } from '../../src/eval/deterministic-embed.ts';
 import type { HybridSearchMeta } from '../../src/core/types.ts';
@@ -59,7 +60,7 @@ beforeAll(async () => {
     compiled_truth: conceptText,
     timeline: conceptText,
   });
-  await engine.upsertChunks(CONCEPT, [{
+  await installFixtureChunks(engine, CONCEPT, [{
     chunk_index: 0,
     chunk_text: conceptText,
     chunk_source: 'compiled_truth',
@@ -76,7 +77,7 @@ beforeAll(async () => {
       compiled_truth: DECOY_TEXT,
       timeline: DECOY_TEXT,
     });
-    await engine.upsertChunks(slug, [{
+    await installFixtureChunks(engine, slug, [{
       chunk_index: 0,
       chunk_text: DECOY_TEXT,
       chunk_source: 'compiled_truth',
@@ -86,6 +87,7 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
+  resetGateway(); // R5: restore the preload baseline for later files in this shard
   await engine.disconnect();
 });
 

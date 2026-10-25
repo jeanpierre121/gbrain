@@ -7,6 +7,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
 import { applySnippetCap, buildSnippetMarker, DEFAULT_AGENT_SNIPPET_CHARS } from '../src/core/search/snippet-cap.ts';
 import type { SearchResult } from '../src/core/types.ts';
@@ -35,7 +36,7 @@ beforeAll(async () => {
   await engine.putPage('notes/walrus', {
     type: 'note', title: 'Walrus fanfare', compiled_truth: LONG_TEXT, frontmatter: {},
   });
-  await engine.upsertChunks('notes/walrus', [
+  await installFixtureChunks(engine, 'notes/walrus', [
     { chunk_index: 0, chunk_text: LONG_TEXT, chunk_source: 'compiled_truth' },
   ]);
   await engine.setConfig('search.mcp_keyword_only', 'true');
@@ -138,5 +139,17 @@ describe('query op snippet cap (#3800)', () => {
       const out = (await queryOp.handler(ctxOf(), { query: 'walrus fanfare', expand: false })) as SearchResult[];
       expect(out[0].chunk_text).toBe(LONG_TEXT);
     });
+  });
+});
+
+describe('large pages: a deep hit points at its own window', () => {
+  test('a truncated hit past the first chunk names get_page around_chunk_id; chunk 0 keeps the page pointer', () => {
+    const long = 'x'.repeat(500);
+    const [deep, first] = applySnippetCap([
+      { slug: 'chat/log-example', chunk_text: long, chunk_id: 42, chunk_index: 7 },
+      { slug: 'chat/log-example', chunk_text: long, chunk_id: 41, chunk_index: 0 },
+    ], 100);
+    expect(deep.chunk_text).toContain('get_page chat/log-example around_chunk_id=42]');
+    expect(first.chunk_text).toContain('get_page chat/log-example for full text');
   });
 });

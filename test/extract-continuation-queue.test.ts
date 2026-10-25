@@ -12,9 +12,11 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 
 describe('extract stale-sweep continuation', () => {
-  test('the continuation add names no queue (structural pin on jobs.ts)', () => {
-    // test-reads-source-ok: pins the continuation add's option shape (no queue key); the behavioral half is the PGLite test below
-    const src = readFileSync(new URL('../src/commands/jobs.ts', import.meta.url), 'utf8');
+  test('the continuation add names no queue (structural pin on the extract handler)', () => {
+    // test-reads-source-ok[structural]: pins the continuation add's option shape (no queue key); the behavioral half is the PGLite test below
+    // Upstream v0.60 moved the extract handler out of jobs.ts into
+    // src/core/minions/handlers/extract.ts.
+    const src = readFileSync(new URL('../src/core/minions/handlers/extract.ts', import.meta.url), 'utf8');
     const m = src.match(/await queue\.add\(\s*'extract',\s*\{ \.\.\.job\.data, continuation_of: job\.id \},\s*\{([^}]*)\}/);
     expect(m).not.toBeNull();
     const opts = m![1];

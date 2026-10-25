@@ -29,7 +29,7 @@ export const EMAIL_SEGMENT_GAP_MINUTES = 60 * 24 * 7;
 export const DEFAULT_SEGMENT_MAX_CHARS = 5800;
 
 /** Pattern id the email path forces (see ParseConversationOpts.forcePatternId). */
-export const EMAIL_THREAD_PATTERN_ID = 'email-thread-heading';
+export const EMAIL_THREAD_PATTERN_ID = 'email-collector-thread';
 
 /**
  * Default senders whose messages carry no conversational facts:
@@ -121,6 +121,14 @@ function decodeEntities(s: string): string {
 }
 const OPEN_IN_GMAIL_RE = /^\[Open in Gmail\]\([^)]*\)\s*$/;
 const EMAIL_SENT_HEADING_RE = /^##\s.*\(sent\)\s*$/m;
+/**
+ * A message heading of upstream's Gmail thread render
+ * (`## <From> · YYYY-MM-DD HH:MM`, src/core/google/google-render.ts). Such a
+ * page keeps upstream's single-email rule (conversation-skip.ts) instead of
+ * the collector's out-of-scope skip. The length bound keeps a pathological
+ * body line linear.
+ */
+const GMAIL_RENDER_HEADING_RE = /^## (?:→ )?[^\n]{1,512} · \d{4}-\d{2}-\d{2} \d{1,2}:\d{2}[ \t]*$/m;
 /**
  * A collector message heading in full shape: `## From — Date (direction)`,
  * where Date starts like an RFC-2822 date (`Thu, 18 Jun 2026` or
@@ -219,33 +227,41 @@ export function normalizeEmailMessages(
 
 /**
  * Email pages with a single inbound message (newsletters, notifications,
- * one-off sends to the owner) are out of scope for conversation facts. Cheap
- * pre-parse check on frontmatter + the heading marker, so enumeration skips
- * them for the cost of one list read and writes no durable audit row.
+ * one-off sends to the owner) are out of scope for conversation facts.
+ * Decided from frontmatter + the heading marker on the page body the
+ * extractor already read (the conversation input, which is segment-aware),
+ * before parsing, so the page writes no durable audit row.
  */
 export function isSingleInboundEmail(
-  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
+  page: Pick<Page, 'type' | 'frontmatter'>,
+  body: string,
 ): boolean {
   if (page.type !== 'email') return false;
   const raw = page.frontmatter?.message_count;
   const count = typeof raw === 'number' ? raw : Number.parseInt(String(raw ?? ''), 10);
   if (!Number.isFinite(count) || count >= 2) return false;
-  return !EMAIL_SENT_HEADING_RE.test(page.compiled_truth ?? '');
+  // Upstream's Gmail thread render keeps upstream's single-email rule.
+  if (GMAIL_RENDER_HEADING_RE.test(body)) return false;
+  return !EMAIL_SENT_HEADING_RE.test(body);
 }
 
 /**
  * Email pages the facts pipeline never extracts: the collector's daily digest
  * pages (type `email-digest`, or `frontmatter.subtype` other than `thread`,
  * e.g. `digest`, whose body is `## Signatures pending` / `## Triage`
- * sections, not messages) and single inbound messages. Enumeration skips
- * both before parsing and writes no audit row.
+ * sections, not messages) and, when the body is given, single inbound
+ * messages. Enumeration checks the digest rule from frontmatter alone (a
+ * listed page may be segmented, so its body is never read there);
+ * processPage applies the single-inbound rule to the body it read.
+ * Neither writes an audit row.
  */
 export function isOutOfScopeEmail(
-  page: Pick<Page, 'type' | 'frontmatter' | 'compiled_truth'>,
+  page: Pick<Page, 'type' | 'frontmatter'>,
+  body?: string,
 ): boolean {
   if (page.type === 'email-digest') return true;
   if (page.type !== 'email') return false;
   const subtype = page.frontmatter?.subtype;
   if (typeof subtype === 'string' && subtype !== 'thread') return true;
-  return isSingleInboundEmail(page);
+  return body !== undefined && isSingleInboundEmail(page, body);
 }

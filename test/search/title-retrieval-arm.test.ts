@@ -25,6 +25,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import {
@@ -33,7 +34,7 @@ import {
   boundWebsearchQuery,
   buildOrFallbackWebsearchQuery,
 } from '../../src/core/search/sql-ranking.ts';
-import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -54,12 +55,9 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
-  // Restore the preload-equivalent gateway for sibling files in this shard.
-  configureGateway({
-    embedding_model: 'openai:text-embedding-3-large',
-    embedding_dimensions: DIM,
-    env: { ...process.env },
-  });
+  // R5: restore the preload baseline for sibling files in this shard; resetGateway()
+  // re-applies the registered baseline factory, so it cannot drift from it.
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -73,7 +71,7 @@ async function seedTitleOnlyPage(): Promise<void> {
     title: 'Chronomancer Codex Ledger',
     compiled_truth: 'A reference document about scheduling practices and planning.',
   });
-  await engine.upsertChunks('projects/chronomancer', [
+  await installFixtureChunks(engine, 'projects/chronomancer', [
     {
       chunk_index: 0,
       chunk_text: 'A reference document about scheduling practices and planning.',
@@ -109,7 +107,7 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: longTitle,
       compiled_truth: 'An annual planning artifact.',
     });
-    await engine.upsertChunks('reports/emerald-falcon', [
+    await installFixtureChunks(engine, 'reports/emerald-falcon', [
       { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
     ]);
 
@@ -133,7 +131,7 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Obsidian Waterfall Registry',
       compiled_truth: 'body text here',
     });
-    await engine.upsertChunks('notes/mixed-chunks', [
+    await installFixtureChunks(engine, 'notes/mixed-chunks', [
       { chunk_index: 0, chunk_text: 'timeline entry text', chunk_source: 'timeline' },
       { chunk_index: 1, chunk_text: 'compiled body text', chunk_source: 'compiled_truth' },
     ]);
@@ -147,13 +145,35 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Cobalt Meridian Atlas',
       compiled_truth: 'unrelated body',
     });
-    await engine.upsertChunks('notes/timeline-only', [
+    await installFixtureChunks(engine, 'notes/timeline-only', [
       { chunk_index: 5, chunk_text: 'later timeline', chunk_source: 'timeline' },
       { chunk_index: 2, chunk_text: 'earlier timeline', chunk_source: 'timeline' },
     ]);
     const tlHits = await engine.searchTitles('Cobalt Meridian Atlas', { limit: 5 });
     const tlHit = tlHits.find(r => r.slug === 'notes/timeline-only')!;
     expect(tlHit.chunk_index).toBe(2); // lowest index when no compiled_truth chunk
+  });
+
+  test('a local OR re-run matches the title only: a timeline word is not a relaxed title hit (#7135)', async () => {
+    await engine.putPage('people/dated-entity', {
+      type: 'person',
+      title: 'Cobalt Meridian Atlas',
+      compiled_truth: 'unrelated body',
+      timeline: '- 2026-10-07: zircon quarry visit',
+    });
+    await installFixtureChunks(engine, 'people/dated-entity', [
+      { chunk_index: 0, chunk_text: 'unrelated body', chunk_source: 'compiled_truth' },
+    ]);
+    const inVector = await (engine as any).db.query(
+      `SELECT search_vector @@ to_tsquery('english', 'zircon') AS hit FROM pages WHERE slug = 'people/dated-entity'`,
+    );
+    expect(inVector.rows[0].hit).toBe(true);
+
+    const slugs = async (q: string) => (await engine.searchTitles(q, { limit: 10 })).map(r => r.slug);
+    expect(await slugs('zircon nebulith')).not.toContain('people/dated-entity');
+    expect(await slugs('quarry nebulith')).not.toContain('people/dated-entity');
+    expect(await slugs('Cobalt Meridian')).toContain('people/dated-entity');
+    expect(await slugs('Cobalt zircon')).toContain('people/dated-entity');
   });
 
   test('respects soft-delete visibility and source scoping', async () => {
@@ -178,6 +198,9 @@ describe('searchTitles — D1 title candidate arm', () => {
       title: 'Zanzibar Protocol Manifest',
       compiled_truth: 'fixture body',
     });
+    await installFixtureChunks(engine, 'test/hidden-fixture', [
+      { chunk_index: 0, chunk_text: 'fixture body', chunk_source: 'compiled_truth' },
+    ]);
     const hits = await engine.searchTitles('Zanzibar Protocol Manifest', { limit: 10 });
     expect(hits.map(r => r.slug)).not.toContain('test/hidden-fixture');
   });
@@ -190,7 +213,7 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
       title: 'Quantum Notes',
       compiled_truth: 'quantum lattice harmonics resonance experiments',
     });
-    await engine.upsertChunks('notes/quantum', [
+    await installFixtureChunks(engine, 'notes/quantum', [
       {
         chunk_index: 0,
         chunk_text: 'quantum lattice harmonics resonance experiments',
@@ -224,7 +247,7 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
       title: 'Partial Overlap',
       compiled_truth: 'quantum computing conference recap',
     });
-    await engine.upsertChunks('notes/partial', [
+    await installFixtureChunks(engine, 'notes/partial', [
       { chunk_index: 0, chunk_text: 'quantum computing conference recap', chunk_source: 'compiled_truth' },
     ]);
 
@@ -245,7 +268,7 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
     expect(hits.length).toBe(0);
   });
 
-  test('the OR retry is BOUNDED and BEST-EFFORT: a cancelled retry degrades to the strict-AND rows', async () => {
+  test('the OR retry is BOUNDED: a cancelled retry surfaces as a statement timeout the hybrid keyword arm fails open on', async () => {
     await seedQuantumPage();
 
     // The retry runs under its own tight statement_timeout because
@@ -279,12 +302,15 @@ describe('searchKeyword — D2 AND→OR fallback', () => {
     }) as unknown as typeof engine.db.query;
 
     try {
-      const hits = await engine.searchKeyword('quantum lattice harmonics zzzmissingtoken', {
+      // Merge of upstream v0.60.416.0: upstream bounds the retry itself
+      // (narrowed OR terms, KEYWORD_RANK_CANDIDATES) and lets a statement
+      // timeout propagate: hybridSearch fails the keyword arm open
+      // (degraded keyword_arm_failed) and the Postgres engine caches the
+      // timeout (#6495). The fork's engine-level swallow is superseded.
+      await expect(engine.searchKeyword('quantum lattice harmonics zzzmissingtoken', {
         limit: 10,
         orFallback: true,
-      });
-      // Degraded, NOT thrown: the caller gets the empty strict-AND result.
-      expect(hits).toEqual([]);
+      })).rejects.toMatchObject({ code: '57014' });
       expect(retryAttempts).toBeGreaterThan(0);
     } finally {
       engine.db.query = realQuery as unknown as typeof engine.db.query;
@@ -331,7 +357,7 @@ describe('hybridSearch — search.keywordOrFallback knob (v=25)', () => {
       title: 'Lab Journal',
       compiled_truth: 'quantum lattice harmonics resonance experiments',
     });
-    await engine.upsertChunks('notes/lab-journal', [
+    await installFixtureChunks(engine, 'notes/lab-journal', [
       {
         chunk_index: 0,
         chunk_text: 'quantum lattice harmonics resonance experiments',
@@ -372,6 +398,10 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   });
   test('interior hyphens are not operators — still relaxed', () => {
     expect(buildOrFallbackWebsearchQuery('alpha-beta gamma')).toBe('alpha OR beta OR gamma');
+  });
+  test('drops repeated words: a repeat adds no match and only multiplies ts_rank work (#7135)', () => {
+    expect(buildOrFallbackWebsearchQuery('idle tab idle reaper')).toBe('idle OR tab OR reaper');
+    expect(buildOrFallbackWebsearchQuery('Idle idle IDLE')).toBeNull();
   });
   test('drops literal OR/AND words so they cannot re-parse as operators', () => {
     expect(buildOrFallbackWebsearchQuery('alpha or beta')).toBe('alpha OR beta');
@@ -415,7 +445,7 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
       title: longTitle,
       compiled_truth: 'An annual planning artifact.',
     });
-    await engine.upsertChunks('reports/emerald-falcon', [
+    await installFixtureChunks(engine, 'reports/emerald-falcon', [
       { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
     ]);
     const results = await hybridSearch(engine, longTitle, { limit: 5 });

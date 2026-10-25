@@ -18,10 +18,11 @@
  * dispatcher bug where viaSubagent=true but subagentId is missing.
  *
  * In v0.15 every allow-list op is treated as idempotent for the two-phase
- * replay path. put_page with a deterministic slug is idempotent at the row
+ * replay path. put_page with its persisted request UUID is idempotent at the journal
  * level; repeats re-derive the same embedding over identical content.
  */
 
+import { budgetedPageRead } from './read-budget.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { operations } from '../../operations.ts';
@@ -29,56 +30,13 @@ import type { AuthInfo, Operation, OperationContext } from '../../operations.ts'
 import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import { normalizeOptionalParams, validateParams } from '../../../mcp/validate-params.ts';
 import { validateSourceId } from '../../utils.ts';
-import { parseMarkdown, serializeMarkdown } from '../../markdown.ts';
-import { loadActivePackForWriteVocabulary } from '../../schema-pack/write-vocabulary.ts';
-import { classifyStoredType, sanitizeTypeForDisplay } from '../../schema-pack/type-usage.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
-import { putPageRejection } from './put-page-result.ts';
+import { putPageRejection, rethrowWithCurrentRevision } from './put-page-result.ts';
+import { BRAIN_TOOL_ALLOWLIST } from './brain-tool-allowlist.ts';
 
-/**
- * v0.15 brain-tool allow-list. Review carefully when extending. Op names
- * verified against origin/master:src/core/operations.ts (post shell-jobs +
- * Knowledge Runtime).
- *
- * Read-only (all safe):
- *   query, search, get_page, list_pages,
- *   get_backlinks, traverse_graph, resolve_slugs, get_ingest_log
- *
- * Conditional write:
- *   put_page (namespace-enforced by the tool schema + server-side check)
- *
- * Every name below MUST exist in src/core/operations.ts OPERATIONS; the
- * brain-allowlist test pins this invariant so an upstream rename fails CI
- * instead of silently dropping a tool.
- */
-export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
-  'query',
-  'search',
-  'get_page',
-  'list_pages',
-  'get_backlinks',
-  'traverse_graph',
-  // v114 (#1941): read-only provenance discovery. Edge-WRITE ops (add_link /
-  // remove_link) are deliberately NOT allowlisted — exposing graph writes to
-  // subagents is a separate trust decision.
-  'list_link_sources',
-  'resolve_slugs',
-  'get_ingest_log',
-  'put_page',
-  // #2778: the canonical timeline-write op. Fenced exactly like put_page —
-  // operations.ts:enforceSubagentSlugFence confines the target slug to the
-  // trusted-workspace allow-list (or the wiki/agents/<id>/ namespace) when
-  // ctx.viaSubagent=true, so a subagent can only append timeline entries to
-  // pages it could have written anyway.
-  'add_timeline_entry',
-  // v0.29 — Salience + Anomaly Detection. Both read-only. `get_recent_transcripts`
-  // is intentionally NOT included: subagent calls always have ctx.remote=true,
-  // and the v0.29 trust gate rejects remote callers — adding it here would be
-  // a footgun (subagent calls op, gets permission_denied, looks like a bug).
-  // The cycle synthesize phase already calls discoverTranscripts directly.
-  'get_recent_salience',
-  'find_anomalies',
-]);
+// The allow-list itself lives in a handler-free module so the MCP surface
+// tiers (src/mcp/surface.ts) can read it without this module's operations import.
+export { BRAIN_TOOL_ALLOWLIST };
 
 /**
  * v0.41 Approach C: per-tool usage_hint surfaced verbatim in the subagent
@@ -216,7 +174,9 @@ export interface BuildBrainToolsOpts {
    */
   sourceId?: string;
   /** Current remote owner grant; never populated from caller tool arguments. */
-  delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources'>;
+  delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources' | 'allowedOperations'>;
+  /** #6297: byte budget on this job's get_page results (SubagentHandlerData.read_budget_bytes); unset = none. */
+  readBudgetBytes?: number;
 }
 
 interface OpContextDeps {
@@ -247,7 +207,8 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     sourceId: deps.sourceId ?? 'default',
     // Preserve explicit per-call source checks without importing direct-write
     // fences or requiring direct read/write scopes for agent-only grants.
-    ...(deps.delegatedAuth ? { auth: { token: '', ...deps.delegatedAuth } } : {}),
+    ...(deps.delegatedAuth ? { auth: { token: '', ...deps.delegatedAuth,
+      principal: { kind: 'oauth_client' as const, id: deps.delegatedAuth.clientId } } } : {}),
     jobId: deps.jobId,
     subagentId: deps.subagentId,
     viaSubagent: true,           // FAIL-CLOSED: put_page etc. enforce namespace
@@ -293,8 +254,8 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
       name: toolName,
       description: op.description,
       input_schema: schema,
-      // v0.15 ships only idempotent brain tools (every allow-listed op is
-      // deterministic over its input; put_page re-writes the same slug).
+      // The persisted tool dispatcher binds mutations to a stable request UUID;
+      // a replay returns the original durable receipt without another write.
       idempotent: true,
       // v0.41 Approach C: surface usage_hint to the system-prompt renderer.
       // Keyed by the unprefixed op name. Undefined when no hint is registered.
@@ -321,55 +282,20 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
         // model instead of crashing inside the handler, and `since: ""` never
         // reaches a handler raw.
         const params = normalizeOptionalParams(op, raw);
+        // #6297: a subagent's full-content read returns the round-trip fields only, not the body twice.
+        if (op.name === 'get_page' && params.include_content === true) params.content_only = true;
         const validationError = validateParams(op, params);
         if (validationError) throw new Error(`${toolName}: ${validationError}`);
-        if (op.name === 'put_page' && opts.allowedSlugPrefixes?.length) {
-          await pinUndeclaredType(params, opCtx);
-        }
-        const output = await op.handler(opCtx, params);
+        const output = op.name === 'put_page'
+          ? await op.handler(opCtx, params).catch(e => rethrowWithCurrentRevision(ctx.engine, opCtx.sourceId ?? 'default', params.slug, e))
+          : await op.handler(opCtx, params);
         const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
         if (rejection) throw new Error(rejection);
+        if (op.name === 'get_page' && opts.readBudgetBytes) return budgetedPageRead(ctx.engine, ctx.jobId, opts.readBudgetBytes, params.slug, output);
         return output;
       },
     };
   });
-}
-
-/**
- * #4852: trusted-workspace subagents (dream synth agentic lane, patterns,
- * delegated jobs — the `allowedSlugPrefixes` writers) author page content
- * model-side, and the model mints types no bundled pack declares
- * (`reflection` / `original` / `pattern`). The orchestrator reverse-writes
- * that type to disk as explicit frontmatter, so every `gbrain sync` re-warns.
- * The oneshot lane already pins its output to 'note' (F5 in
- * subagent-oneshot.ts); this extends the same rule to the tool-calling lanes:
- * an EXPLICIT frontmatter type the active pack classifies as `undeclared`
- * rewrites to 'note' with the model's type kept in `frontmatter.legacy_type`
- * (the base-v2 D12 shape). Declared types and aliases pass through untouched
- * (alias_of stays a sync warning); no resolvable pack → no-op (the #4655
- * fail-open posture). Never rejects — patterns children run require_writes
- * and a rejection would dead-letter the whole phase. Runs BEFORE import so
- * content_hash is computed once over the final type (no re-chunk churn).
- */
-async function pinUndeclaredType(
-  params: Record<string, unknown>,
-  opCtx: OperationContext,
-): Promise<void> {
-  if (typeof params.content !== 'string' || typeof params.slug !== 'string') return;
-  const parsed = parseMarkdown(params.content, `${params.slug}.md`);
-  if (parsed.typeExplicit !== true) return;
-  const pack = await loadActivePackForWriteVocabulary(opCtx);
-  if (!pack || classifyStoredType(parsed.type, pack.manifest).kind !== 'undeclared') return;
-  params.content = serializeMarkdown(
-    { ...parsed.frontmatter, legacy_type: parsed.type },
-    parsed.compiled_truth,
-    parsed.timeline,
-    { type: 'note', title: parsed.title, tags: parsed.tags },
-  );
-  opCtx.logger.warn(
-    `undeclared type '${sanitizeTypeForDisplay(parsed.type)}' normalized to 'note' ` +
-    `(legacy_type kept; pack ${pack.manifest.name})`,
-  );
 }
 
 /**

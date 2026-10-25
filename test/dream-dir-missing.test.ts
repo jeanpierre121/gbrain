@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process';
 
 const REPO = resolve(import.meta.dir, '..');
 const CLI = join(REPO, 'src', 'cli.ts');
-const SKIP = process.env.GBRAIN_SKIP_SUBPROCESS_TESTS === '1';
+const SKIP = process.env.GBRAIN_TEST_SKIP_SUBPROCESS === '1';
 
 describe.skipIf(SKIP)('gbrain dream --dir <missing path> (regression)', () => {
   let home = '';

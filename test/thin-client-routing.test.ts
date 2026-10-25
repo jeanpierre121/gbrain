@@ -8,7 +8,7 @@
  *   (b) host-bound forms return false (search modes --reset, search tune
  *       --apply, quarantine scan/clear, takes extract) so the caller falls
  *       through to refuseThinClient's hint;
- *   (c) recognized-but-malformed routable forms print usage + exit(1)
+ *   (c) recognized-but-malformed routable forms report a nonzero CLI verdict
  *       instead of returning false (the subcommand IS routable — the args
  *       are just wrong).
  *
@@ -19,17 +19,19 @@
  * JSON.parse(content[0].text) path.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as mcpClient from '../src/core/mcp-client.ts';
 import { routeThinClientCommand } from '../src/commands/thin-client-routing.ts';
+import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 
-const cfg = {} as GBrainConfig; // callRemoteTool is stubbed; cfg is never read
+const cfg: GBrainConfig = { engine: 'pglite', remote_mcp: { mcp_url: 'http://127.0.0.1:1/mcp', issuer_url: 'http://127.0.0.1:1', oauth_client_id: 'fixture', oauth_client_secret: 'fixture' } };
 
 const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
 let callSpy: ReturnType<typeof spyOn>;
 let logSpy: ReturnType<typeof spyOn>;
 let errSpy: ReturnType<typeof spyOn>;
+let previousExitCode: typeof process.exitCode;
 const logs: string[] = [];
 const errs: string[] = [];
 
@@ -55,7 +57,15 @@ afterAll(() => {
   errSpy.mockRestore();
 });
 
+afterEach(() => {
+  _resetCliExitVerdictForTests();
+  // Verdicts also mirror process.exitCode; undefined does not clear it in Bun.
+  process.exitCode = previousExitCode ?? 0;
+});
+
 beforeEach(() => {
+  previousExitCode = process.exitCode;
+  _resetCliExitVerdictForTests();
   calls.length = 0;
   logs.length = 0;
   errs.length = 0;
@@ -64,7 +74,13 @@ beforeEach(() => {
 /** One recorded remote call, asserted whole (op name + exact args). */
 function soleCall(): { tool: string; args: Record<string, unknown> } {
   expect(calls).toHaveLength(1);
-  return calls[0]!;
+  const call = calls[0]!;
+  if (['takes_add', 'takes_update', 'takes_resolve', 'takes_supersede'].includes(call.tool)) {
+    expect(call.args.request_id).toMatch(/^[0-9a-f-]{36}$/);
+    const { request_id, ...args } = call.args;
+    return { ...call, args };
+  }
+  return call;
 }
 
 describe('routeThinClientCommand — (a) op name + param mapping per route', () => {
@@ -185,6 +201,36 @@ describe('routeThinClientCommand — (a) op name + param mapping per route', () 
   });
 });
 
+describe('routeThinClientCommand — beliefs changes runs through the host delta', () => {
+  const window = { source_id: 'default', since: '2026-10-01T00:00:00.000Z', until: '2026-10-08T00:00:00.000Z', coverage_from: null, truncated: false,
+    changes: [{ kind: 'fact', slug: 'companies/acme-example', change: 'added', subject: { claim: 'Acme sells gadgets' }, before: null, after: { fact: 'Acme sells gadgets' },
+      before_known: true, cause: { event: 'fact.asserted', op: 'put_page' }, evidence: { event_id: 7, recorded_at: '2026-10-02T00:00:00.000Z', slug: 'companies/acme-example', row: 1 }, trust_tier: 'agent' }] };
+  const reply = (body: unknown) => callSpy.mockImplementationOnce(async (_cfg: GBrainConfig, tool: string, args: Record<string, unknown> = {}) => {
+    calls.push({ tool, args });
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  });
+
+  test('entities and --since map onto delta {since, beliefs, entities}; the text is the host renderer', async () => {
+    reply({ pages: [], beliefs: window });
+    expect(await routeThinClientCommand(cfg, 'beliefs', ['changes', 'companies/acme-example', 'people/alice-example', '--since', '2026-10-01'])).toBe(true);
+    expect(soleCall()).toEqual({ tool: 'delta', args: { since: '2026-10-01T00:00:00.000Z', beliefs: true, entities: 'companies/acme-example,people/alice-example' } });
+    expect(logs.join('\n')).toBe(['Belief changes on default from 2026-10-01T00:00:00.000Z to 2026-10-08T00:00:00.000Z: 1',
+      '- [2026-10-02] fact on companies/acme-example: added "Acme sells gadgets" (put_page, event 7, row 1)'].join('\n'));
+  });
+
+  test('a host whose delta has no beliefs is reported, not printed as empty', async () => {
+    reply({ pages: [] });
+    const stderr: string[] = [];
+    const write = spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => { stderr.push(String(chunk)); return true; }) as never);
+    try {
+      expect(await routeThinClientCommand(cfg, 'beliefs', ['changes'])).toBe(true);
+    } finally { write.mockRestore(); }
+    expect(currentExitCode()).not.toBe(0);
+    expect(stderr.join('')).toContain('Error [unavailable]: The remote brain\'s delta does not return belief changes');
+    expect(logs).toEqual([]);
+  });
+});
+
 describe('routeThinClientCommand — (b) host-bound forms return false', () => {
   const hostBound: Array<[string, string[]]> = [
     ['search', ['modes', '--reset']],
@@ -192,6 +238,16 @@ describe('routeThinClientCommand — (b) host-bound forms return false', () => {
     ['quarantine', ['scan']],
     ['quarantine', ['clear']],
     ['takes', ['extract']],
+    ['takes', ['grades']],
+    ['beliefs', ['changes', '--source', 'notes']],
+    ['beliefs', ['status']],
+    ['takes', ['horizon', 'scan']],
+    ['takes', ['horizon', 'set', 'companies/acme-example', '--row', '1', '--date', '2025-06-30']],
+    ['takes', ['horizon', 'clear', 'companies/acme-example', '--row', '1']],
+    ['takes', ['journal']],
+    ['takes', ['journal', '--holder', 'alice-example', '--json']],
+    ['takes', ['scorecard', '--group-by', 'holder']],
+    ['takes', ['scorecard', 'alice-example', '--min-n', '5']],
   ];
 
   for (const [command, args] of hostBound) {
@@ -216,8 +272,14 @@ describe('routeThinClientCommand — (c) malformed routable forms print usage + 
     } finally {
       exitSpy.mockRestore();
     }
-    expect(exited).toBe('EXIT:1');
-    expect(errs.join('\n')).toContain('Usage:');
+    if (command === 'takes' && ['add', 'update', 'resolve', 'supersede'].includes(args[0])) {
+      expect(exited).toBeNull();
+      expect(currentExitCode()).toBe(1);
+      expect(errs.join('\n')).toContain('Error [invalid_params]');
+    } else {
+      expect(exited).toBe('EXIT:1');
+      expect(errs.join('\n')).toContain('Usage:');
+    }
     // No remote write attempted on a usage error.
     expect(calls).toHaveLength(0);
   }
