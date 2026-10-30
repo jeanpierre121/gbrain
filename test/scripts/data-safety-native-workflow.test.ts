@@ -34,12 +34,53 @@ const suites = [
 ];
 
 describe('data-safety native CI coverage', () => {
+  test('the darwin-x64 cell posts diag/native-heartbeat statuses from its first step to its last, never on a fork pull request', () => {
+    const job = workflow.jobs.native as typeof workflow.jobs.native & { permissions?: Record<string, string> };
+    expect(job.permissions).toEqual({ contents: 'read', statuses: 'write' });
+    const names = job.steps.map(step => step.name ?? step.uses ?? '');
+    const start = job.steps.findIndex(step => step.name === 'Start the diagnostic heartbeat');
+    const stop = job.steps.findIndex(step => step.name === 'Stop the diagnostic heartbeat');
+    expect(names[start - 1]).toStartWith('actions/checkout@');
+    expect(stop).toBe(job.steps.length - 1);
+    const env = {
+      GH_TOKEN: '${{ github.token }}',
+      GBRAIN_HEARTBEAT_ENABLED: "${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}",
+      GBRAIN_HEARTBEAT_SHA: '${{ github.event.pull_request.head.sha || github.sha }}',
+      GBRAIN_HEARTBEAT_CELL: '${{ matrix.target }}/${{ matrix.bun }}',
+    };
+    expect(job.steps[start]).toEqual({ name: 'Start the diagnostic heartbeat', if: "matrix.target == 'darwin-x64'", env, run: 'bash scripts/native/heartbeat.sh start' });
+    expect(job.steps[stop]).toEqual({ name: 'Stop the diagnostic heartbeat', if: "always() && matrix.target == 'darwin-x64'", env,
+      run: 'bash scripts/native/heartbeat.sh stop "${{ job.status }}"' });
+    for (const step of job.steps) if (step !== job.steps[start] && step !== job.steps[stop]) expect(JSON.stringify(step)).not.toContain('github.token');
+    const safety = job.steps.find(entry => entry.name === 'Verify native data-safety contracts')!;
+    expect(safety.run).toContain('  GBRAIN_HEARTBEAT_ENABLED=1 bash scripts/native/heartbeat.sh mark "$1" || true\n  bun --no-env-file test --timeout=180000 "$1" &');
+    const caller = (load(readFileSync(join(import.meta.dir, '../../.github/workflows/test.yml'), 'utf8')) as {
+      jobs: Record<string, { uses?: string; permissions?: Record<string, string> }> }).jobs['native-locks']!;
+    expect(caller.uses).toBe('./.github/workflows/native-locks.yml');
+    expect(caller.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
+  });
+
+  test('a Linux job after every cell finalizes a darwin-x64 heartbeat its cell left pending, never on a fork pull request', () => {
+    const finalize = (workflow.jobs as unknown as Record<string, { needs: string[]; if: string; 'runs-on': string; permissions: Record<string, string>; steps: Step[] }>)['heartbeat-finalize']!;
+    expect(finalize.needs).toEqual(['native']);
+    expect(finalize.if).toBe("${{ always() && inputs.scope != 'smoke' }}");
+    expect(finalize['runs-on']).toBe('ubicloud-standard-2-ubuntu-2404');
+    expect(finalize.permissions).toEqual({ actions: 'read', contents: 'read', statuses: 'write' });
+    const step = finalize.steps.at(-1)!;
+    expect(step).toEqual({ name: 'Finalize darwin-x64 heartbeats left pending', run: 'bun scripts/native/heartbeat-finalize.ts', env: {
+      GH_TOKEN: '${{ github.token }}',
+      GBRAIN_HEARTBEAT_ENABLED: "${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && '1' || '0' }}",
+      GBRAIN_HEARTBEAT_SHA: '${{ github.event.pull_request.head.sha || github.sha }}',
+    } });
+    for (const other of finalize.steps.slice(0, -1)) expect(JSON.stringify(other)).not.toContain('github.token');
+  });
+
   test('the opt-in console diagnostic has an isolated Windows matrix without filtering the acceptance suites', () => {
     const job = workflow.jobs['windows-backup-console'];
     expect(job['runs-on']).toBe('${{ matrix.runner }}');
     expect(job.strategy['fail-fast']).toBe(false);
     expect(job.strategy.matrix.runner).toEqual(['windows-2022', 'windows-11-arm']);
-    expect(job.strategy.matrix.bun).toEqual(['1.4.0', '1.4.4']);
+    expect(job.strategy.matrix.bun).toEqual(['1.4.4']);
     expect(job.steps.some(entry => entry.run === 'bun scripts/native/verify.ts')).toBe(true);
     const step = job.steps.find(entry => entry.name === 'Compare native hidden-window launch behavior');
     expect(step).toBeDefined();
@@ -68,12 +109,12 @@ describe('data-safety native CI coverage', () => {
     } finally { rmSync(temporary, { recursive: true, force: true }); }
   });
 
-  test('the direct dotnet program comparison has its own four-cell opt-in Windows job', () => {
+  test('the direct dotnet program comparison has its own two-cell opt-in Windows job', () => {
     const job = workflow.jobs['windows-backup-dotnet'];
     expect(job['runs-on']).toBe('${{ matrix.runner }}');
     expect(job.strategy['fail-fast']).toBe(false);
     expect(job.strategy.matrix.runner).toEqual(['windows-2022', 'windows-11-arm']);
-    expect(job.strategy.matrix.bun).toEqual(['1.4.0', '1.4.4']);
+    expect(job.strategy.matrix.bun).toEqual(['1.4.4']);
     expect(job.steps.some(entry => entry.run === 'bun scripts/native/verify.ts')).toBe(true);
     const step = job.steps.find(entry => entry.name === 'Compare cmdlet and direct dotnet ACL programs');
     expect(step).toBeDefined();
@@ -324,7 +365,7 @@ describe('data-safety native CI coverage', () => {
     }
   });
 
-  test('the crash robot runs a fixed list beside the soak: scope pr under 820/1020 s on pull requests, full under 1200/1800 s elsewhere, exploration nightly, Postgres through PgBouncer', () => {
+  test('the crash robot runs a fixed list beside the soak: scope pr under 820/620 s on pull requests, full under 1200/880 s elsewhere, exploration nightly, Postgres through PgBouncer', () => {
     const persistence = load(readFileSync(join(import.meta.dir, '../../.github/workflows/persistence-validation.yml'), 'utf8')) as {
       jobs: { 'crash-robot': { steps: Step[]; services: Record<string, { env?: Record<string, string> }> } };
     };
@@ -332,7 +373,7 @@ describe('data-safety native CI coverage', () => {
     expect(job.services.pgbouncer?.env?.POOL_MODE).toBe('transaction');
     const step = job.steps.find(entry => entry.run?.includes('scripts/persistence/validate.ts'));
     expect(step?.env?.ROBOT_SCOPE).toBe("${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'pr' || 'full' }}");
-    expect(step?.env?.ROBOT_SECONDS).toBe("${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (matrix.engine == 'postgres' && '1020' || '820') || (matrix.engine == 'postgres' && '1800' || '1200') }}");
+    expect(step?.env?.ROBOT_SECONDS).toBe("${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (matrix.engine == 'postgres' && '620' || '820') || (matrix.engine == 'postgres' && '880' || '1200') }}");
     expect(step?.env?.ROBOT_EXPLORE).toBe("${{ github.event_name == 'schedule' && 'nightly' || '' }}");
     expect(step?.env?.GBRAIN_PGBOUNCER_URL).toContain(':55433/');
     const argv = (env: Record<string, string>) => Bun.spawnSync(['bash', '-e', '-o', 'pipefail', '-c', `
@@ -342,8 +383,8 @@ describe('data-safety native CI coverage', () => {
     const head = ['--no-env-file', 'scripts/persistence/validate.ts', '--engine=postgres', '--schedules=0', '--operations=0', '--no-crashes'];
     expect(argv({ ROBOT_SCOPE: 'pr', ROBOT_SECONDS: '820', ROBOT_EXPLORE: '' })).toEqual([...head, '--robot-scope=pr', '--robot-seconds=820',
       '--manifest=.context/persistence-robot.json']);
-    const nightly = argv({ ROBOT_SCOPE: 'full', ROBOT_SECONDS: '1800', ROBOT_EXPLORE: 'nightly' });
-    expect(nightly.slice(0, -2)).toEqual([...head, '--robot-scope=full', '--robot-seconds=1800']);
+    const nightly = argv({ ROBOT_SCOPE: 'full', ROBOT_SECONDS: '880', ROBOT_EXPLORE: 'nightly' });
+    expect(nightly.slice(0, -2)).toEqual([...head, '--robot-scope=full', '--robot-seconds=880']);
     expect(nightly.at(-2)).toBe(`--explore-day=${Math.floor(Date.now() / 86_400_000)}`);
     expect(nightly.at(-1)).toBe('--manifest=.context/persistence-robot.json');
   });

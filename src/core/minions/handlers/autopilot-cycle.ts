@@ -106,7 +106,7 @@ export function makeAutopilotCycleHandler(engine: BrainEngine): MinionHandler {
     const explicitRepoPath: string | null = !sourceId && typeof job.data.repoPath === 'string' ? job.data.repoPath : null;
     const brainDirResolution: import('../../brain-dir.ts').BrainDirResolution = sourceId && connectorSource
       ? { dir: null, reason: 'source_no_path' }
-      : await resolveBrainDir(engine, explicitRepoPath, sourceId);
+      : await resolveBrainDir(engine, explicitRepoPath, sourceId, { explicitMustBeAbsolute: true });
     if (brainDirResolution.reason === 'explicit_missing') {
       // A failed job carrying the reason (attempts → dead-letter), never a
       // worker crash and never a silent run against the worker's cwd.
