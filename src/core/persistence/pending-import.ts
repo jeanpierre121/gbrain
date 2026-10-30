@@ -22,7 +22,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { Action } from '../agent-output.ts';
 import { gitChildEnv } from '../git-env.ts';
 import { opError, type OperationError } from '../ops/contract.ts';
-import { PENDING_IMPORT_MESSAGE } from './verb-errors.ts';
+import { PENDING_IMPORT_MESSAGE, PENDING_IMPORT_OWNER } from './verb-errors.ts';
 
 export const PENDING_IMPORT = 'pending_import';
 /** #6693: the receipt origin of a write refused because sync holds the page's file (heldFileRefusal). */
@@ -76,8 +76,8 @@ export async function committedPendingImport(engine: BrainEngine, sourceId: stri
   const [source] = await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [sourceId]);
   const rel = `./${relative(root, path).split(sep).join('/')}`;
   try {
-    const head = (await gitRead(root, ['rev-parse', '--verify', '--quiet', `HEAD:${rel}`], signal)).trim();
-    if (!head || (await gitRead(root, ['hash-object', '--', rel], signal)).trim() !== head) return false;
+    const head = await committedBlob(root, path, signal);
+    if (!head) return false;
     if (!source?.last_commit) return true;
     await gitRead(root, ['cat-file', '-e', `${source.last_commit}^{commit}`], signal);
     let imported = '';
@@ -92,7 +92,42 @@ export async function committedPendingImport(engine: BrainEngine, sourceId: stri
   }
 }
 
-/** The refusal: nothing was overwritten; a remember waits for its replay, any other write is resubmitted after the next sync. */
+/** The blob id HEAD holds at `path` (inside `root`), or null when HEAD has no entry there or Git cannot read it. Rejects only when `signal` aborts. */
+export async function headBlob(root: string, path: string, signal?: AbortSignal): Promise<string | null> {
+  return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', `HEAD:./${relative(root, path).split(sep).join('/')}`], signal), signal);
+}
+
+/**
+ * The blob id HEAD holds at `path` when the working-tree file there is exactly that blob (`hash-object` applies the
+ * path's clean filters, as `git add` would); null when the file differs, is absent, or HEAD has no entry there.
+ */
+export async function committedBlob(root: string, path: string, signal?: AbortSignal): Promise<string | null> {
+  const head = await headBlob(root, path, signal);
+  if (!head) return null;
+  return await quiet(gitRead(root, ['hash-object', '--', `./${relative(root, path).split(sep).join('/')}`], signal), signal) === head ? head : null;
+}
+
+/**
+ * The newest commit after `from` (to HEAD) that touched `path`: the door commit of a strict publication that landed
+ * before its row; null when no commit in that range touched it, or when Git cannot read it.
+ */
+export async function landedCommit(root: string, from: string | null, path: string): Promise<string | null> {
+  return quiet(gitRead(root, ['rev-list', '-1', from ? `${from}..HEAD` : 'HEAD', '--', `:(literal)${relative(root, path).split(sep).join('/')}`]));
+}
+
+/** The commit HEAD names in `root`, or null on an unborn branch or when Git cannot read it. */
+export async function headCommit(root: string, signal?: AbortSignal): Promise<string | null> {
+  return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', 'HEAD'], signal), signal);
+}
+
+function quiet(read: Promise<string>, signal?: AbortSignal): Promise<string | null> {
+  return read.then(out => out.trim() || null, error => { if (signal?.aborted) throw error; return null; });
+}
+
+/**
+ * The refusal: nothing was overwritten; a remember waits for its replay, any other write is resubmitted after the next sync.
+ * GBRA-133: neither fix starts a sync; both read the status, so no caller puts a second sync owner beside a running one.
+ */
 export function pendingImportRefusal(row: { source_id: string; slug: string; operation?: string }, remote: boolean): OperationError {
   const status = ['gbrain', 'sync', 'status', '--source', row.source_id, '--json'];
   const remember = row.operation === 'remember';
@@ -100,9 +135,9 @@ export function pendingImportRefusal(row: { source_id: string; slug: string; ope
     ? { argv: status, consent: [], actor: 'provider', requires_exclusive: false, verify: { argv: status }, docs: 'docs/guides/write-refusals.md#pending_import',
       why: `The fact is kept in this request's receipt and queued for one automatic replay attempt by the first managed sync that imports the file; do not save it again. `
         + `This read-only status shows when the source has synced; until the replay commits, gbrain repair failed-writes --source ${row.source_id} lists the fact (a replay that is refused stays there for a person to replay).` }
-    : { argv: ['gbrain', 'sync', '--source', row.source_id, '--no-pull', '--json'], consent: [], actor: remote ? 'host_admin' : 'agent', requires_exclusive: false,
+    : { argv: status, consent: [], actor: remote ? 'host_admin' : 'agent', requires_exclusive: false,
       verify: { argv: status }, docs: 'docs/guides/write-refusals.md#pending_import',
-      why: 'Imports the committed change on the brain host; then read the page again and resubmit the intended write with a new request_id.' };
+      why: `${PENDING_IMPORT_OWNER.replace('<source>', row.source_id)} Once it has, read the page again and resubmit the intended write with a new request_id.` };
   return opError('source_changed', PENDING_IMPORT_MESSAGE,
     `Nothing was overwritten. The canonical file of ${row.slug} in source ${row.source_id} holds a change committed through Git that managed sync has not imported yet, `
     + (remember ? 'so this remember was refused and kept: the first sync that imports the file makes one replay attempt, with its original date and authority.'

@@ -48,6 +48,7 @@ import type { BrainEngine } from '../engine.ts';
 import { tryAcquireDbLock, waitForDbLockTakeover, inspectLock, isLockHolderLive, type DbLockHandle, lockHostIdentity } from '../db-lock.ts';
 import { currentBrainId, readWorkers, workerRegistryReadFailure } from './worker-registry.ts';
 import { autopilotOperatorPauseMarkerPath, autopilotPaused } from '../autopilot-paths.ts';
+import { gbrainPath } from '../config.ts';
 import { registerSignalOwner, triggerCleanupAndExit } from '../process-cleanup.ts';
 import { resolveEnvNumber } from '../env-number.ts';
 import { pidFileContents, processStartStamp } from './supervisor-pid.ts';
@@ -75,7 +76,7 @@ export interface SupervisorOpts {
   concurrency: number;
   /** Queue name (passed to child). Default: 'default'. */
   queue: string;
-  /** PID file path. Default: `${HOME}/.gbrain/supervisor.pid` (parent dir auto-created). */
+  /** PID file path. Default: `<gbrain home>/supervisor-<brain-id>.pid`, GBRAIN_HOME honoured (parent dir auto-created). */
   pidFile: string;
   /** Max consecutive crashes before giving up. Default: 10. */
   maxCrashes: number;
@@ -144,7 +145,6 @@ export interface SupervisorOpts {
 export const DEFAULT_PID_FILE: string = (() => {
   const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
   if (envOverride && envOverride.length > 0) return envOverride;
-  const home = process.env.HOME ?? '/tmp';
   // #1849: key the default pidfile on the brain id so two DIFFERENT brains
   // under one HOME don't share `supervisor.pid` and falsely block each other's
   // pidfile guard. Derived from config (no DB connect), so it's safe to
@@ -153,7 +153,7 @@ export const DEFAULT_PID_FILE: string = (() => {
   // singleton authority; this just removes the common-case footgun.
   let brainId = 'default';
   try { brainId = currentBrainId(); } catch { /* fallback 'default' */ }
-  return `${home}/.gbrain/supervisor-${brainId}.pid`;
+  return gbrainPath(`supervisor-${brainId}.pid`);
 })();
 
 const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
