@@ -117,7 +117,7 @@ export interface PreparationStallMeta {
 }
 export type GitHoldReason = InvalidFrontmatterReason | 'rename_source_changed' | 'explicit_id_conflict' | FenceReason | OriginConflictReason | PageIdentityHoldReason
   | 'symlink_in_repo' | 'symlink_outside_root' | 'symlink_dangling' | 'symlink_loop' | 'permission_denied' | 'not_regular_file' | 'skip_worktree' | 'deleted_locally'
-  | 'not_utf8' | 'control_character' | 'never_committed' | 'ignored' | 'origin_unknown';
+  | 'not_utf8' | 'control_character' | 'never_committed' | 'ignored' | 'origin_unknown' | 'storage_invalid';
 /** GBRA-130: why a `page_identity_changed` hold's path has no page sync may write (A-17, B-3, B-4). */
 export type PageIdentityHoldReason = 'several_tombstones' | 'spelling' | 'identity_differs';
 /** #6712 PR 4b: the sides a `file_drift` Decision can be about, and the states of a deleted side (design v3.2 §4). */
@@ -613,6 +613,8 @@ export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, re
     // GBRA-133: an unknown-side drift held before #7340's baseline rule (a Git edit to a page with no import record) imports
     // now when the page still holds its file at the baseline commit, so it is screened once more.
     || (record.code === 'file_drift' && fileDriftSide(record.meta) === 'unknown' && (record.meta.drift_version ?? 0) < FILE_DRIFT_VERSION)
+    // #8007: a deletion held while gbrain.yml's storage section was invalid is decided again by every sync, so a fixed file settles it.
+    || (record.code === 'file_drift' && record.meta.reason === 'storage_invalid')
     || (outOfAttemptsHold(record.code) && record.meta.stall?.gbrain_version !== VERSION)
     // GBRA-130 A-6: an owner fault is the writer's, not the file's: an upgrade re-tests the path.
     || (record.code === 'page_write_failed' && record.meta.write_failure?.gbrain_version !== VERSION)
@@ -716,6 +718,13 @@ function deletedDriftFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'met
   const revision = record.meta.page_revision ? ` (revision ${record.meta.page_revision})` : '';
   const preview = (prefer: 'database' | 'file') => heldDriftPreviewArgv(source, 'deleted', state, prefer, record.path);
   const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
+  if (state === 'file_gone' && record.meta.reason === 'storage_invalid') {
+    return { argv: ['gbrain', 'storage', 'status'], consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/storage-tiering.md',
+      why: `${record.path} is gone, but gbrain.yml's storage section is invalid or ambiguous about db_only (it does not load, declares db_only in a form that resolved no directory, or lists a deprecated supabase_only next to canonical keys), so sync cannot tell whether page ${slug} is database-only and kept it instead of deleting it (#8007). This read-only check names the problem; fix gbrain.yml at the source root (list db_only directories in block style or as a one-line [a/, b/] list), commit it, then sync again.`,
+      then: { argv: ['gbrain', 'sync', '--source', source, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+        why: `Decides ${record.path} again under the fixed gbrain.yml: a database-only page is kept, any other deletion follows its usual proof.` },
+      verify };
+  }
   const uncommitted = state === 'file_gone' && (record.meta.reason === 'never_committed' || record.meta.reason === 'ignored');
   const what = state === 'file_gone' && record.meta.reason === 'origin_unknown' ? `${record.path} is gone, and Git could not show whether a commit held it (its history read did not finish), so sync kept page ${slug} instead of deleting it (#7130). The --held preview reads the whole history and names the file's provenance. `
     : uncommitted ? `${record.path} is gone, but Git never committed it${record.meta.reason === 'ignored' ? ' (.gitignore excludes it)' : ''}, so its absence is no evidence of a deletion and sync kept page ${slug} instead of deleting it (#7130). Put the file back and commit it (un-ignore it first) to keep the page file-backed. `
@@ -808,8 +817,11 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
         : `page ${slug} changed in the database${record.meta.page_revision ? ` (revision ${record.meta.page_revision})` : ''}`;
       const preview = (prefer: 'database' | 'file') => ['gbrain', 'repair', 'file-drift', '--source', source, '--slug', slug, '--prefer', prefer];
       const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
-      const held = `${by} since ${record.path} was last imported, so sync held the file instead of overwriting the database version (${record.meta.sides === 'database' && !record.meta.side ? 'the file did not change in Git'
-        : fileDriftSide(record.meta) === 'both' ? 'the file changed too' : 'no import record says which side changed'}). `;
+      const side = fileDriftSide(record.meta);
+      const held = side === 'unknown' && !record.meta.competing_request_id
+        ? `Page ${slug} differs from ${record.path} and has no import record to tell whether the file or the database changed, so sync held the file instead of overwriting the database version. `
+        : `${by} since ${record.path} was last imported, so sync held the file instead of overwriting the database version (${record.meta.sides === 'database' && !record.meta.side ? 'the file did not change in Git'
+          : side === 'both' ? 'the file changed too' : 'no import record says whether the file changed too'}). `;
       const decide = 'Decide with the user which version wins, run the apply command the preview prints, then sync again. The rest of the source is not blocked.';
       // #6517: a shared-origin delete kept the file for this surviving page, and its receipt names importing the file.
       const shared = record.meta.shared_origin === true;
@@ -867,6 +879,11 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
       return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
         user_message: `${record.path} nests YAML aliases in its frontmatter that expand past gbrain's size limit, so sync holds it and the rest of source ${source} keeps syncing. An older gbrain imported these bytes; this version refuses them on purpose. Reduce the alias nesting in its frontmatter (or write the values out), or remove the file, then commit and run gbrain sync --source ${source} --no-pull.`,
         why: 'The alias bound (#7018) stops a few hundred bytes of nested anchors from expanding into gigabytes; it is intended, so the page keeps its last imported version until the file changes.',
+        verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
+    case 'visibility_noncanonical':
+      return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
+        user_message: `${record.path} asks for visibility: private in a spelling page privacy does not read (another case, a block scalar, a list, a flow mapping or a merge key), so sync holds it instead of storing a world-readable page, and the rest of source ${source} keeps syncing. Write visibility: private on its own frontmatter line (lowercase key and value), commit, then run gbrain sync --source ${source} --no-pull.`,
+        why: 'Page privacy reads only the exact lowercase visibility: private; no frontmatter repair rewrites a privacy request, and the hold re-screens when the file changes.',
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'content_null_bytes':
       return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),

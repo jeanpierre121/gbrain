@@ -184,7 +184,7 @@ export function makeAutopilotGlobalMaintenanceHandler(engine: BrainEngine, deps:
     const explicitRepoPath: string | null = typeof job.data.repoPath === 'string'
       ? job.data.repoPath
       : null;
-    const brainDirResolution = await resolveBrainDir(engine, explicitRepoPath, undefined);
+    const brainDirResolution = await resolveBrainDir(engine, explicitRepoPath, undefined, { explicitMustBeAbsolute: true });
     if (brainDirResolution.reason === 'explicit_missing') {
       throw new Error(`autopilot-global-maintenance: repoPath does not exist: ${explicitRepoPath} (brain_dir: explicit_missing)`);
     }

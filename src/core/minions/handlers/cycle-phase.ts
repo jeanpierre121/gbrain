@@ -41,7 +41,7 @@ export function makeCyclePhaseHandler(engine: BrainEngine, phase: string): Minio
       }
       sourceId = rawSourceId;
     }
-    const brainDirResolution = await resolveBrainDir(engine, sourceId ? null : explicitRepoPath, sourceId);
+    const brainDirResolution = await resolveBrainDir(engine, sourceId ? null : explicitRepoPath, sourceId, { explicitMustBeAbsolute: true });
     if (brainDirResolution.reason === 'explicit_missing') {
       throw new Error(`${phase}: repoPath does not exist: ${explicitRepoPath} (brain_dir: explicit_missing)`);
     }
