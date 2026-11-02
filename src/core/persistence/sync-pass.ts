@@ -24,7 +24,7 @@ import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { resolveSlugRootMode } from '../sync-anchor.ts';
 import { resolveSlugForPath } from '../sync.ts';
 import { join } from 'node:path';
-import { hasUnresolvedDbOnlyDeclaration, isDeclaredDbOnlySlug, isKeepDbSlug, loadStorageConfig } from '../storage-config.ts';
+import { dbOnlyVerdict, hasUnresolvedDbOnlyDeclaration, isDeclaredDbOnlySlug, isKeepDbSlug, loadStorageConfig } from '../storage-config.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile } from '../company-brain/profile.ts';
 import { sha256 } from './digest.ts';
@@ -32,7 +32,7 @@ import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { colonFileRefusal, COLON_REFUSAL_MESSAGES, readSyncFile, resolveManagedSyncContext, syncExcludePatterns, syncGitAsync, type ManagedSyncContext, type SyncFileRefusal } from './sync-discovery.ts';
 import { isWindowsColonTarget } from './native-file-target.ts';
 import { confirmedSyncDelta } from '../sync-rename-identity.ts';
-import { fileDriftSide, holdBasisMoved, holdRescreenDue, type DeletionCandidate, readGitHoldRetryPaths, readGitSourceHolds, SYNC_IMPORT_PROVENANCE_OP, syncImportParser, syncImportParsers,
+import { FILE_DRIFT_VERSION, fileDriftSide, holdBasisMoved, holdRescreenDue, type DeletionCandidate, readGitHoldRetryPaths, readGitSourceHolds, SYNC_IMPORT_PROVENANCE_OP, syncImportParser, syncImportParsers,
   type GitHoldRecord, type SyncImportParser, type SyncImportProvenance } from './sync-holds.ts';
 import { movedDriftHolds, sameParser } from './sync-prescreen.ts';
 import { sameSyncOrigin, selectOriginClaimant, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
@@ -804,13 +804,13 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
       record: record ? { blobOids: recordBlobOids, revision: recordRevision != null ? String(recordRevision) : null, parserSame: sameParser(pages.parserOf(at!), fp(path)) } : null,
       attested, levelSha256: probe?.rawSha256 ?? null,
       published: !!attested?.hash && probe?.rawSha256 === attested.hash,
-      hold: hold ? { atLevel: holdAtLevel(hold, level, probe?.rawSha256 ?? null) && !moved.has(path), rescreenDue: holdRescreenDue(hold, retry.has(hold.path)), retried: retry.has(hold.path) } : null,
+      hold: hold ? { atLevel: holdAtLevel(hold, level, probe?.rawSha256 ?? null) && !moved.has(path), rescreenDue: holdRescreenDue(hold, retry.has(hold.path)), retried: retry.has(hold.path), ...(unscreenedDrift(hold) ? { unscreened: true } : {}) } : null,
       marker: marker ?? virtualMarker, baseline: needsBaseline ? baselineOf(path) : null,
       spelling: legacySpelling.has(path) ? 'legacy' : twins.has(path),
       episodeUnsatisfied: input.pass ? !!input.pass.episodeFullId && live && (record ? pages.fullEpisode[at!] : undefined) !== input.pass.episodeFullId
         : input.full === true && live,
       derivedCurrent: live && pages.derivedCurrent(at!), fullObligation: input.pass ? !!input.pass.episodeFullId : input.full === true,
-      keepDb: !mirror && keepDbPrefixes.length > 0 && row && isKeepDbSlug(pages.slug[at!]!, keepDbPrefixes), dbOnly: row && (isDeclaredDbOnlySlug(pages.slug[at!]!, storage) || (dbOnlyUnknown ? 'unknown' : false)),
+      keepDb: !mirror && keepDbPrefixes.length > 0 && row && isKeepDbSlug(pages.slug[at!]!, keepDbPrefixes), dbOnly: row && (dbOnlyUnknown ? isDeclaredDbOnlySlug(pages.slug[at!]!, storage) || 'unknown' : dbOnlyVerdict(pages.slug[at!]!, storage)),
       openWork: row && open.pageIds.has(Number(pages.id[at!])) || open.origins.has(origin),
     };
     return { state, ...(row ? { at } : {}), ...(legacyPageless ? { legacyPageless } : {}) };
@@ -917,7 +917,7 @@ export async function readShadowLevel(engine: BrainEngine, input: { sourceId: st
   }
   return { sourceId, incarnation, root, gitRoot, scope, slugMode, mode, strict, head, baselineCommit, full: input.full === true, kind: kind.kind, kindBlockers: kind.blockers,
     heldRenames: holds.flatMap(hold => hold.meta.rename_from ? [{ path: toGit(hold.path), rename: hold.meta.rename_from }] : []),
-    releasableHolds: holds.filter(hold => !domain.has(toGit(hold.path)) || (!dbOnlyUnknown && hold.code === 'file_drift' && hold.meta.reason === 'storage_invalid')).map(hold => hold.path),
+    releasableHolds: holds.filter(hold => !domain.has(toGit(hold.path)) || (!dbOnlyUnknown && hold.code === 'file_drift' && hold.meta.reason === 'storage_invalid' && (!hold.slug || dbOnlyVerdict(hold.slug, storage) !== 'unknown'))).map(hold => hold.path),
     deletionCandidates: deletionCandidates(holds, path => domain.has(path) && !tree.has(path)
       && !(mode === 'working' && (untracked.has(path) || index.has(path))) && !readPresent(root, path, scope), toGit),
     paths, reconcilable, ...(colon.refusals.size ? { fileRefusals: [...colon.refusals.values()] } : {}), timings_ms: timings, statements: statements + attestationStatements + 3,
@@ -968,7 +968,7 @@ async function readLevelSettings(engine: BrainEngine, context: ManagedSyncContex
   return { slugMode: settled(slugModeRead), exclude: settled(excludeRead), pack: settled(packRead), mirror: settled(mirrorRead), workingConfig: settled(workingRead),
     metafilePages: settled(metafilePagesRead), strict: context.source.config?.canonical === 'git', strategy: input.pass?.strategy ?? (context.source.config?.strategy as string | undefined) ?? 'markdown',
     includeHidden: [...new Set([...input.pass?.includeHidden ?? [], ...(settled(includeHiddenRead) ?? '').split(/[\n,]/).map(v => v.trim()).filter(Boolean)].map(v => v.endsWith('/') ? `${v}**` : v))],
-    keepDbPrefixes: storage?.keep_db ?? [], storage, dbOnlyUnknown: storageInvalid || storage?.deprecated_db_only_ignored === true || hasUnresolvedDbOnlyDeclaration(root, storage) };
+    keepDbPrefixes: storage?.keep_db ?? [], storage, dbOnlyUnknown: storageInvalid || hasUnresolvedDbOnlyDeclaration(root, storage) };
 }
 
 /** A failed mark, proof or delta read: the round reads again without them (it aborted a Postgres snapshot). */
@@ -1186,6 +1186,13 @@ function readPresent(root: string, gitPath: string, scope: string): boolean {
   const path = scope ? gitPath.slice(scope.length + 1) : gitPath;
   try { return readSyncFile(root, path) !== null; } catch { return true; }
 }
+
+/**
+ * #7199: a side-`unknown` drift hold written before the drift screen compared the page with the file at the baseline commit
+ * (`drift_version` below FILE_DRIFT_VERSION). The pass that wrote it moved the baseline to the held file, so its one re-screen
+ * (sync-holds.ts holdRescreenDue) also compares the page with the file's earlier committed versions.
+ */
+const unscreenedDrift = (hold: GitHoldRecord) => hold.code === 'file_drift' && fileDriftSide(hold.meta) === 'unknown' && (hold.meta.drift_version ?? 0) < FILE_DRIFT_VERSION;
 
 /** Whether a hold still describes the path at level `L`, in the hold's own domain (a pinned blob, working bytes, or a deletion). */
 function holdAtLevel(hold: GitHoldRecord, level: string | null, diskSha256: string | null): boolean {

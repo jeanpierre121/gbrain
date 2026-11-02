@@ -14,6 +14,9 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import type { OperationMeta } from '../core/ops/contract.ts';
 import { loadConfig } from '../core/config.ts';
 import { withRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
+import { withCallerAccess } from '../core/search/private-visibility.ts';
+import { appliedAccessSummary, remoteCallerAccess } from '../core/access/caller.ts';
+import { audienceInArguments, audienceInArgumentsError, logAudienceAssertion, parseAudience, type AudienceAuditEvent, type AudienceChannels, type AudiencePrincipal } from '../core/access/audience.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
@@ -27,6 +30,7 @@ import { pageCapLine } from '../core/search/remote-page-cap.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
 import { emptyRead, hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
 import { assertUnscopedReadReachesPages } from '../core/sources-not-readable.ts';
+import { accessPolicyNotices } from '../core/access/policy-notice.ts';
 import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, type ToolConnection } from './hidden-tool-hint.ts';
 import { opAllowedForBoundClient } from '../core/ops/context.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
@@ -165,6 +169,11 @@ export interface ToolResult {
 }
 
 export interface DispatchOpts {
+  /**
+   * GBRA-231: the shared-agent audience channels the transport read from the request (the X-Gbrain-On-Behalf-Of
+   * header, request-level `_meta`), set by harness code. Never populated from tool arguments, which are refused.
+   */
+  onBehalfOf?: AudienceChannels;
   /** #6696 (A5): set by the trusted transport for the user's own agent calls; never from wire params. */
   admissionOrigin?: OperationContext['admissionOrigin'];
   /** Configuration selected by the resident transport, never populated from wire params. */
@@ -237,6 +246,13 @@ export interface DispatchOpts {
    * it there). Cache/telemetry identity only — never a trust surface.
    */
   sessionId?: string;
+  /**
+   * GBRA-156: the request asked for no `_meta.brain_hot_memory` block (MCP request-level
+   * `_meta.hot_memory: "off"`, resolved by the transport). The same value inside the tool
+   * arguments' `_meta` works too. A channel or shared session sets it so a requester's own
+   * facts never ride into a reply other people read.
+   */
+  hotMemoryOff?: boolean;
   /**
    * v0.31 (eD3): hook called by the dispatcher AFTER op.handler succeeds
    * to compute `_meta.brain_hot_memory` for the response. Wrapped in its
@@ -410,7 +426,7 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
   const r = retrieval as {
     type_filter_notice?: unknown;
     other_names?: Array<{ name: string; alias: string; slug: string }>;
-    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string; linked_from?: string; corrected_by?: number }>;
+    saved_facts?: Array<{ fact: string; entity_slug: string | null; valid_from: string; source: string; linked_from?: string; corrected_by?: number; quoted?: string }>;
     answer_id?: unknown;
     feedback?: { rateable?: boolean; how_to_rate?: string };
   };
@@ -423,7 +439,7 @@ export function retrievalNoticeBlocks(result: unknown, retrieval: unknown): stri
   }
   if (r.saved_facts?.length) {
     const { text, more } = wholeItemsWithin('Saved facts (remember): about the entity this query names (newest first), then facts those point to, then matches for its words; recall returns more:\n',
-      r.saved_facts.map(f => `- ${f.fact} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}${f.linked_from ? `; named in a saved fact about ${f.linked_from}` : ''}${f.corrected_by ? '; corrected by a newer saved fact above' : ''}]`),
+      r.saved_facts.map(f => `- ${f.fact}${f.quoted ? '\n' : ''} [entity: ${f.entity_slug ?? 'none'}; saved ${String(f.valid_from).slice(0, 10)}; provenance: ${f.source}${f.linked_from ? `; named in a saved fact about ${f.linked_from}` : ''}${f.corrected_by ? '; corrected by a newer saved fact above' : ''}]`),
       '\n', SAVED_FACTS_NOTICE_MAX_CHARS);
     blocks.push(more ? `${text}\n(+${more} more; recall returns them)` : text);
   }
@@ -815,6 +831,11 @@ export function requestMetaSessionId(requestParams: unknown): string | undefined
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
 }
 
+/** GBRA-156: `_meta.hot_memory: "off"` on the request (pass `request.params`) or inside the tool arguments (pass the arguments). */
+export function hotMemoryOffIn(params: unknown): boolean {
+  return (params as { _meta?: { hot_memory?: unknown } } | undefined)?._meta?.hot_memory === 'off';
+}
+
 /**
  * Read `_meta.session_id` out of the tool arguments when present. The MCP
  * spec carries `_meta` as a sibling of `arguments`, but several clients (and
@@ -872,6 +893,8 @@ export function buildOperationContext(
   };
 }
 
+const WORLD_ONLY_PACK_OPS = new Set(['context_pack', 'delta']);
+
 /**
  * Resolve operation, validate params, build context, invoke handler, format result.
  *
@@ -887,14 +910,51 @@ export async function dispatchToolCall(
   // #6721: a read op answers every config read from one snapshot of the table
   // (config-snapshot.ts); a write reads config live, so it sees its own writes.
   // GBRA-156: and reads the brain identity and each local writer's credential once for its pre-submission checks.
-  const run = () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, opts));
+  // GBRA-156: a remote read sees private pages only in the sources its grant names under private_pages: granted_sources.
+  // Writes, local callers and every path outside this call keep the empty set, so they hide or see exactly what they did.
+  // context_pack and delta stay world-only for every caller unless a trusted local one passes include_private, so no grant widens them.
+  const readOnly = operations.find(o => o.name === name)?.mutating === false;
+  const privateSources = readOnly && opts.remote !== false && !WORLD_ONLY_PACK_OPS.has(name) ? opts.auth?.privatePages?.sources : undefined;
+  const resolved = opts.metaHook && (opts.hotMemoryOff === true || hotMemoryOffIn(params)) ? { ...opts, metaHook: undefined } : opts;
+  // GBRA-218: a remote call also carries its credential's member identity, which every caller-aware read checks page readers against.
+  // GBRA-231: or the audience a shared agent's harness asserts, resolved (and refused) on every call before any work.
+  const run = async () => {
+    if (opts.remote === false) return withCallerAccess({ privateReadableSources: [] }, () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, resolved)));
+    let audience: AudiencePrincipal[] | null = null;
+    let access: Awaited<ReturnType<typeof remoteCallerAccess>>;
+    const assertion = (outcome: AudienceAuditEvent['outcome']) => logAudienceAssertion({ outcome, op: name, audience: audience ?? [], transport: opts.transport ?? 'unknown',
+      principal: opts.auth?.principal ? `${opts.auth.principal.kind}:${opts.auth.principal.id}` : opts.transport === 'stdio' ? 'local_stdio' : 'unknown' });
+    try {
+      if (audienceInArguments(params)) throw audienceInArgumentsError();
+      audience = parseAudience(opts.onBehalfOf);
+      access = await remoteCallerAccess(engine, opts.auth, privateSources, opts.transport, audience);
+    } catch (e) {
+      if (!(e instanceof OperationError) || !String(e.code).startsWith('on_behalf_of_')) throw e;
+      assertion(e.code as AudienceAuditEvent['outcome']);
+      return errorResult(e, opts, { op: name });
+    }
+    if (audience) assertion('accepted');
+    return withCallerAccess(access, async () => {
+      const out = await withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, resolved));
+      // _meta.access (MCP_META_CHANNELS.md): the view this call was answered under, for the harness; own producer, isolated.
+      try { out._meta = { ...(out._meta ?? {}), access: await appliedAccessSummary(engine, opts.auth, [opts.sourceId, ...(opts.localFederatedSourceIds ?? [])]) }; } catch { /* the key is absent */ }
+      return out;
+    });
+  };
   if (name === 'search' || name === 'query') return withSearchConnectionBudget(() => withRequestConfigSnapshot(engine, run));
-  return operations.find(o => o.name === name)?.mutating === false
+  return readOnly
     ? withRequestConfigSnapshot(engine, run)
     : withoutRequestConfigSnapshot(run);
 }
 
 /** The response-meta hook's keys, or its failure message; never rejects (a hook failure degrades to no keys). */
+// The hot-memory hook reads ctx.sourceId only, so a call that names its own sources gets no ambient-source payload.
+function namesOwnSources(params: Record<string, unknown>, sourceId: string | undefined): boolean {
+  const ids = params.source_ids;
+  if (Array.isArray(ids) ? ids.length > 0 : typeof ids === 'string' && ids.trim() !== '') return true;
+  return typeof params.source_id === 'string' && params.source_id !== '' && params.source_id !== sourceId;
+}
+
 async function runMetaHook(hook: NonNullable<DispatchOpts['metaHook']>, name: string, ctx: OperationContext): Promise<{ meta?: Record<string, unknown>; failure?: string }> {
   try { return { meta: await hook(name, ctx) }; }
   catch (metaErr) { return { failure: metaErr instanceof Error ? metaErr.message : String(metaErr) }; }
@@ -1086,7 +1146,8 @@ async function dispatchResolvedCall(
     // #5575 CEO-18: a floored connection only reaches read ops that enforce its floor.
     enforceReadTrustFloor(ctx.auth, op);
     // GBRA-156: a read op does not change what the hook reads, so it runs beside the handler (a degraded engine's reconnect stays the handler's).
-    const earlyMeta = opts.metaHook && op.mutating === false && !isEngineDegraded(engine) ? runMetaHook(opts.metaHook, name, ctx) : undefined;
+    const metaHook = namesOwnSources(safeParams, ctx.sourceId) ? undefined : opts.metaHook;
+    const earlyMeta = metaHook && op.mutating === false && !isEngineDegraded(engine) ? runMetaHook(metaHook, name, ctx) : undefined;
     const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
       (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
     let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;
@@ -1141,7 +1202,7 @@ async function dispatchResolvedCall(
     const rerankDegradedCalls = recordRerankDegradation(responseMeta, opts);
     notices.push(...recallInteropNotices(name, result, responseMeta, safeParams,
       { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding, rerankDegradedCalls }));
-    notices.push(...await hiddenContentNotices(engine, name, result, ctx, opts));
+    notices.push(...accessPolicyNotices(name, ctx), ...await hiddenContentNotices(engine, name, result, ctx, opts));
     // Monthly backup-coverage: one AGGREGATE notice per process (counts only —
     // never a local path or source id). The refresher runs on the stdio
     // transport ONLY — the WP1/D7 locality axis localOnly ops use; 'http' or
@@ -1178,8 +1239,8 @@ async function dispatchResolvedCall(
     // The hook is wrapped in its own try/catch — any DB blip / cache miss /
     // helper crash degrades to no hook keys rather than flipping the whole
     // tool call to error.
-    if (opts.metaHook) {
-      const { meta, failure } = await (earlyMeta ?? runMetaHook(opts.metaHook, name, ctx));
+    if (metaHook) {
+      const { meta, failure } = await (earlyMeta ?? runMetaHook(metaHook, name, ctx));
       if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
       if (failure !== undefined) ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${failure}; degrading to no hook keys`);
     }
